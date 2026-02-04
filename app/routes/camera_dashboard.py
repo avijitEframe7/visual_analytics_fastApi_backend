@@ -14,6 +14,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import asyncio
 import json
+from datetime import datetime
 
 from app.routes.camera_config import CAMERA_CONFIG, get_rtsp_urls
 
@@ -43,7 +44,8 @@ FRAME_SKIP = 1
 RESIZE = (640, 460)
 BATCH_SIZE = 4
 QUEUE_SIZE = 50
-BATCH_TIMEOUT = 0.5          # (s) process partial batch after this
+BATCH_TIMEOUT = 0.5          # (s) process partial batch after this (multi-camera)
+SINGLE_STREAM_BATCH_TIMEOUT = 0.05  # (s) much shorter so single-camera doesn't wait 0.5s → ~2 FPS
 MAX_RECONNECT_ATTEMPTS = 5
 RECONNECT_DELAY = 2
 
@@ -82,8 +84,32 @@ USER_SELECTION_TO_VIOLATION: dict = {
 # Stop signal for live detection pipeline
 pipeline_stop_event = threading.Event()
 
-# Ordered camera ids for current pipeline (index = display queue index)
+# Ordered camera ids for current pipeline (index = display queue index); set by API, then passed into pipeline
 current_camera_ids: List[str] = []
+# Camera ids for the *running* pipeline (used by YOLO worker for log filenames); set at pipeline start
+pipeline_camera_ids: List[str] = []
+
+# Violation classes to log to notification_logs.json (negative PPE classes)
+VIOLATION_CLASSES_FOR_LOG = {"no_helmet", "no_vest", "no_goggles", "no_safetyshoes"}
+# Display form for log (Exception_Type shown in UI)
+VIOLATION_DISPLAY_NAMES = {
+    "no_helmet": "NO_helmet",
+    "no_vest": "NO_Vest",
+    "no_goggles": "NO_goggles",
+    "no_safetyshoes": "NO_safetyshoes",
+}
+NOTIFICATION_LOGS_DIR = os.path.abspath(os.path.join(_script_dir, "..", "logs"))
+# Per-camera log files by user's choice: notification_logs_camera_0.json, notification_logs_camera_1.json, ...
+def _notification_log_path(camera_id) -> str:
+    sid = str(camera_id) if camera_id is not None else "unknown"
+    return os.path.join(NOTIFICATION_LOGS_DIR, f"notification_logs_camera_{sid}.json")
+# Per-camera locks so writing one camera never blocks another (keeps multi-cam FPS high)
+_notification_log_locks: dict = {}
+_notification_log_locks_mu = threading.Lock()
+# Queue + writer thread so detection never blocks on file I/O (avoids FPS drop)
+NOTIFICATION_LOG_QUEUE: "queue.Queue" = queue.Queue(maxsize=5000)
+NOTIFICATION_LOG_BATCH_SIZE = 50
+NOTIFICATION_LOG_WRITER_TIMEOUT = 0.5
 
 # ======================
 # YOLO MODEL (GPU; loaded on first /start_live_detection, not on import)
@@ -117,6 +143,82 @@ def _ensure_model_loaded():
                 sys.exit(1)
             raise
     print(f"[camera_dashboard] GPU: {gpu_name} | Model: {os.path.basename(MODEL_PATH)}")
+
+
+def _get_camera_log_lock(camera_id):
+    """Per-camera lock so one camera's write does not block another's (reduces delay in multi-cam)."""
+    key = str(camera_id) if camera_id is not None else "unknown"
+    with _notification_log_locks_mu:
+        if key not in _notification_log_locks:
+            _notification_log_locks[key] = threading.Lock()
+        return _notification_log_locks[key]
+
+
+def _flush_notification_log_for_camera(camera_id, records: list):
+    """Append violation records to this camera's JSON file only. Called by writer thread."""
+    if not records:
+        return
+    key = str(camera_id) if camera_id is not None else "unknown"
+    path = _notification_log_path(key)
+    with _get_camera_log_lock(key):
+        try:
+            data = []
+            if os.path.isfile(path):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                except (json.JSONDecodeError, IOError):
+                    data = []
+            if not isinstance(data, list):
+                data = []
+            data.extend(records)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            print(f"[camera_dashboard] notification_log write error (camera {camera_id}): {e}")
+
+
+def _notification_log_writer():
+    """Background thread: drain queue, group by camera, write each camera's file. Keeps detection non-blocking."""
+    batch = []
+    while True:
+        try:
+            item = NOTIFICATION_LOG_QUEUE.get(timeout=NOTIFICATION_LOG_WRITER_TIMEOUT)
+            batch.append(item)
+            while len(batch) < NOTIFICATION_LOG_BATCH_SIZE:
+                try:
+                    batch.append(NOTIFICATION_LOG_QUEUE.get_nowait())
+                except queue.Empty:
+                    break
+            # Group by camera_id (string) so each camera gets one write → notification_logs_camera_{id}.json
+            by_camera = {}
+            for (d, c, t) in batch:
+                ckey = str(c) if c is not None else "unknown"
+                rec = {"Exception_Type": d, "time_occurred": t}
+                by_camera.setdefault(ckey, []).append(rec)
+            for camera_id, records in by_camera.items():
+                _flush_notification_log_for_camera(camera_id, records)
+            batch.clear()
+        except queue.Empty:
+            if batch:
+                by_camera = {}
+                for (d, c, t) in batch:
+                    ckey = str(c) if c is not None else "unknown"
+                    rec = {"Exception_Type": d, "time_occurred": t}
+                    by_camera.setdefault(ckey, []).append(rec)
+                for camera_id, records in by_camera.items():
+                    _flush_notification_log_for_camera(camera_id, records)
+                batch.clear()
+        except Exception as e:
+            print(f"[camera_dashboard] notification_log_writer error: {e}")
+            batch.clear()
+
+
+# Start notification log writer thread once (daemon; never blocks detection)
+_thread = threading.Thread(target=_notification_log_writer, daemon=True, name="Notification-Log-Writer")
+_thread.start()
+
 
 # ======================
 # OPTIMIZED RTSP READER
@@ -244,8 +346,11 @@ def yolo_batch_worker():
                     pass
             if not got_any:
                 time.sleep(0.01)
+            # Single stream: use short timeout so we don't cap at ~2 FPS (batch rarely fills to BATCH_SIZE)
+            n_queues = len(pipeline_input_queues)
+            timeout = SINGLE_STREAM_BATCH_TIMEOUT if n_queues == 1 else BATCH_TIMEOUT
             should_process = len(batch) >= BATCH_SIZE or (
-                batch and (time.time() - last_batch_time) >= BATCH_TIMEOUT
+                batch and (time.time() - last_batch_time) >= timeout
             )
             if should_process:
                 # Process batch
@@ -265,9 +370,29 @@ def yolo_batch_worker():
                         idx = 0 if nq == 1 else min(cam_id, nq - 1)
                         disp = {"camera_id": cam_id, "frame": frame_copy, "result": res}
                         boxes = res.boxes
+                        # Enqueue violations whenever there are boxes (per-camera JSON by pipeline_camera_ids from frontend)
+                        if len(boxes) > 0:
+                            names = res.names if hasattr(res, "names") else getattr(model, "names", {})
+                            cls_np = boxes.cls.cpu().numpy()
+                            if nq == 1 and pipeline_camera_ids:
+                                user_camera_id = str(pipeline_camera_ids[0])
+                            else:
+                                user_camera_id = str(pipeline_camera_ids[cam_id]) if (cam_id < len(pipeline_camera_ids)) else str(cam_id)
+                            for i in range(len(cls_np)):
+                                raw_name = str(names.get(int(cls_np[i]), cls_np[i]) or "")
+                                norm = raw_name.lower().replace(" ", "_").strip()
+                                if norm in VIOLATION_CLASSES_FOR_LOG:
+                                    display_name = VIOLATION_DISPLAY_NAMES.get(norm, raw_name)
+                                    try:
+                                        NOTIFICATION_LOG_QUEUE.put_nowait((
+                                            display_name,
+                                            user_camera_id,
+                                            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                        ))
+                                    except queue.Full:
+                                        pass
                         if len(boxes) > 0 and idx < len(pipeline_output_queues):
                             out_q = pipeline_output_queues[idx]
-                            names = res.names if hasattr(res, "names") else getattr(model, "names", {})
                             xyxy_np = boxes.xyxy.cpu().numpy()
                             cls_np = boxes.cls.cpu().numpy()
                             conf_np = boxes.conf.cpu().numpy()
@@ -411,17 +536,20 @@ def start_pipeline(
     video_path: Optional[str] = None,
     rtsp_urls: Optional[List[str]] = None,
     class_filter: Optional[List[str]] = None,
+    camera_ids: Optional[List[str]] = None,
 ) -> Optional[threading.Thread]:
     """
     Start the detection pipeline.
     - If video_path is provided and valid -> run video detection.
     - Else -> run live RTSP detection (use rtsp_urls if provided, else all from config).
     - class_filter: if None or empty -> show all classes; else only these class names are shown.
+    - camera_ids: frontend-selected camera ids; used for per-camera log filenames (notification_logs_camera_{id}.json).
     Returns the video thread if video detection is started, otherwise None.
     """
-    global pipeline_input_queues, pipeline_output_queues, pipeline_display_queues, pipeline_imshow_queues, selected_class_names
+    global pipeline_input_queues, pipeline_output_queues, pipeline_display_queues, pipeline_imshow_queues, selected_class_names, pipeline_camera_ids
     pipeline_stop_event.clear()
     selected_class_names = set(c.lower().replace(" ", "_") for c in class_filter) if class_filter else None
+    pipeline_camera_ids[:] = list(camera_ids) if camera_ids else list(current_camera_ids)
     _ensure_model_loaded()
     urls_to_use = rtsp_urls if rtsp_urls is not None else RTSP_URLS
     video_thread: Optional[threading.Thread] = None
@@ -762,7 +890,7 @@ def api_start_live_detection(body: Optional[StartBody] = None):
         current_camera_ids = list(ids) if ids else sorted(
             [k for k in CAMERA_CONFIG if CAMERA_CONFIG[k].get("type") == "rtsp" and CAMERA_CONFIG[k].get("url")]
         )
-    threading.Thread(target=lambda: start_pipeline(video_path, rtsp_urls, b.classes), daemon=True).start()
+    threading.Thread(target=lambda: start_pipeline(video_path, rtsp_urls, b.classes, current_camera_ids), daemon=True).start()
     # Feed URL for selected camera (single-cam: first in list)
     feed_camera_id = current_camera_ids[0] if current_camera_ids else "0"
     feed_url = f"/api/camera_dashboard/live_detection_feed?camera_id={feed_camera_id}"
