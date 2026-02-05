@@ -1,5 +1,5 @@
 # Run from project root (visual_analytics_fastapi_backend), not from app/:
-#   uvicorn app.main:app --host 127.0.0.1 --port 8000
+#   uvicorn main:app --host 127.0.0.1 --port 8000
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.routes import users, health, auth, main_dashboard, camera_dashboard, model_management, camera_management, notification_management
