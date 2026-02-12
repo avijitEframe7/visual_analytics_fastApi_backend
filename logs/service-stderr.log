@@ -139,3 +139,8 @@ INFO:     Waiting for application startup.
 2026-02-12 11:21:08,409 - main - INFO - Application startup complete
 INFO:     Application startup complete.
 INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+2026-02-12 12:13:45,751 - main - INFO - Shutting down Visual Analytics API...
+INFO:     Application shutdown complete.
+INFO:     Finished server process [6164]
