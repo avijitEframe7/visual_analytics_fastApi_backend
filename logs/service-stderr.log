@@ -1,0 +1,141 @@
+INFO:     Started server process [6352]
+INFO:     Waiting for application startup.
+2026-02-05 16:13:22,858 - main - INFO - Starting Visual Analytics API...
+2026-02-05 16:13:22,858 - main - INFO - Application startup complete
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+INFO:     Shutting down
+INFO:     Finished server process [6352]
+2026-02-05 16:48:35,770 - main - INFO - Shutting down Visual Analytics API...
+ERROR:    Traceback (most recent call last):
+  File "D:\Visual_Merge_new\visual_analytics_fastapi_backend\.venv\lib\site-packages\uvicorn\_compat.py", line 60, in asyncio_run
+    return loop.run_until_complete(main)
+  File "C:\Users\user\AppData\Local\Programs\Python\Python39\lib\asyncio\base_events.py", line 629, in run_until_complete
+    self.run_forever()
+  File "C:\Users\user\AppData\Local\Programs\Python\Python39\lib\asyncio\windows_events.py", line 316, in run_forever
+    super().run_forever()
+  File "C:\Users\user\AppData\Local\Programs\Python\Python39\lib\asyncio\base_events.py", line 596, in run_forever
+    self._run_once()
+  File "C:\Users\user\AppData\Local\Programs\Python\Python39\lib\asyncio\base_events.py", line 1890, in _run_once
+    handle._run()
+  File "C:\Users\user\AppData\Local\Programs\Python\Python39\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "D:\Visual_Merge_new\visual_analytics_fastapi_backend\.venv\lib\site-packages\uvicorn\server.py", line 71, in serve
+    await self._serve(sockets)
+  File "C:\Users\user\AppData\Local\Programs\Python\Python39\lib\contextlib.py", line 124, in __exit__
+    next(self.gen)
+  File "D:\Visual_Merge_new\visual_analytics_fastapi_backend\.venv\lib\site-packages\uvicorn\server.py", line 331, in capture_signals
+    signal.raise_signal(captured_signal)
+KeyboardInterrupt
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "D:\Visual_Merge_new\visual_analytics_fastapi_backend\.venv\lib\site-packages\starlette\routing.py", line 700, in lifespan
+    await receive()
+  File "D:\Visual_Merge_new\visual_analytics_fastapi_backend\.venv\lib\site-packages\uvicorn\lifespan\on.py", line 137, in receive
+    return await self.receive_queue.get()
+  File "C:\Users\user\AppData\Local\Programs\Python\Python39\lib\asyncio\queues.py", line 166, in get
+    await getter
+asyncio.exceptions.CancelledError
+
+INFO:     Started server process [6444]
+INFO:     Waiting for application startup.
+2026-02-05 16:49:23,022 - main - INFO - Starting Visual Analytics API...
+2026-02-05 16:49:23,022 - main - INFO - Application startup complete
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+INFO:     Started server process [6444]
+INFO:     Waiting for application startup.
+2026-02-07 10:39:30,002 - main - INFO - Starting Visual Analytics API...
+2026-02-07 10:39:30,002 - main - INFO - Application startup complete
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+INFO:     Started server process [6516]
+INFO:     Waiting for application startup.
+2026-02-11 10:17:28,821 - main - INFO - Starting Visual Analytics API...
+2026-02-11 10:17:28,821 - main - INFO - Application startup complete
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+INFO:     Shutting down
+INFO:     Finished server process [6516]
+2026-02-12 11:18:23,375 - main - INFO - Shutting down Visual Analytics API...
+ERROR:    Traceback (most recent call last):
+  File "D:\Visual_Merge_new\visual_analytics_fastapi_backend\.venv\lib\site-packages\uvicorn\_compat.py", line 60, in asyncio_run
+    return loop.run_until_complete(main)
+  File "C:\Users\user\AppData\Local\Programs\Python\Python39\lib\asyncio\base_events.py", line 629, in run_until_complete
+    self.run_forever()
+  File "C:\Users\user\AppData\Local\Programs\Python\Python39\lib\asyncio\windows_events.py", line 316, in run_forever
+    super().run_forever()
+  File "C:\Users\user\AppData\Local\Programs\Python\Python39\lib\asyncio\base_events.py", line 596, in run_forever
+    self._run_once()
+  File "C:\Users\user\AppData\Local\Programs\Python\Python39\lib\asyncio\base_events.py", line 1890, in _run_once
+    handle._run()
+  File "C:\Users\user\AppData\Local\Programs\Python\Python39\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "D:\Visual_Merge_new\visual_analytics_fastapi_backend\.venv\lib\site-packages\uvicorn\server.py", line 71, in serve
+    await self._serve(sockets)
+  File "C:\Users\user\AppData\Local\Programs\Python\Python39\lib\contextlib.py", line 124, in __exit__
+    next(self.gen)
+  File "D:\Visual_Merge_new\visual_analytics_fastapi_backend\.venv\lib\site-packages\uvicorn\server.py", line 331, in capture_signals
+    signal.raise_signal(captured_signal)
+KeyboardInterrupt
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "D:\Visual_Merge_new\visual_analytics_fastapi_backend\.venv\lib\site-packages\starlette\routing.py", line 700, in lifespan
+    await receive()
+  File "D:\Visual_Merge_new\visual_analytics_fastapi_backend\.venv\lib\site-packages\uvicorn\lifespan\on.py", line 137, in receive
+    return await self.receive_queue.get()
+  File "C:\Users\user\AppData\Local\Programs\Python\Python39\lib\asyncio\queues.py", line 166, in get
+    await getter
+asyncio.exceptions.CancelledError
+
+INFO:     Started server process [7592]
+INFO:     Waiting for application startup.
+2026-02-12 11:19:28,540 - main - INFO - Starting Visual Analytics API...
+2026-02-12 11:19:28,540 - main - INFO - Application startup complete
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+INFO:     Shutting down
+INFO:     Finished server process [7592]
+2026-02-12 11:20:18,532 - main - INFO - Shutting down Visual Analytics API...
+ERROR:    Traceback (most recent call last):
+  File "D:\Visual_Merge_new\visual_analytics_fastapi_backend\.venv\lib\site-packages\uvicorn\_compat.py", line 60, in asyncio_run
+    return loop.run_until_complete(main)
+  File "C:\Users\user\AppData\Local\Programs\Python\Python39\lib\asyncio\base_events.py", line 629, in run_until_complete
+    self.run_forever()
+  File "C:\Users\user\AppData\Local\Programs\Python\Python39\lib\asyncio\windows_events.py", line 316, in run_forever
+    super().run_forever()
+  File "C:\Users\user\AppData\Local\Programs\Python\Python39\lib\asyncio\base_events.py", line 596, in run_forever
+    self._run_once()
+  File "C:\Users\user\AppData\Local\Programs\Python\Python39\lib\asyncio\base_events.py", line 1890, in _run_once
+    handle._run()
+  File "C:\Users\user\AppData\Local\Programs\Python\Python39\lib\asyncio\events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "D:\Visual_Merge_new\visual_analytics_fastapi_backend\.venv\lib\site-packages\uvicorn\server.py", line 71, in serve
+    await self._serve(sockets)
+  File "C:\Users\user\AppData\Local\Programs\Python\Python39\lib\contextlib.py", line 124, in __exit__
+    next(self.gen)
+  File "D:\Visual_Merge_new\visual_analytics_fastapi_backend\.venv\lib\site-packages\uvicorn\server.py", line 331, in capture_signals
+    signal.raise_signal(captured_signal)
+KeyboardInterrupt
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "D:\Visual_Merge_new\visual_analytics_fastapi_backend\.venv\lib\site-packages\starlette\routing.py", line 700, in lifespan
+    await receive()
+  File "D:\Visual_Merge_new\visual_analytics_fastapi_backend\.venv\lib\site-packages\uvicorn\lifespan\on.py", line 137, in receive
+    return await self.receive_queue.get()
+  File "C:\Users\user\AppData\Local\Programs\Python\Python39\lib\asyncio\queues.py", line 166, in get
+    await getter
+asyncio.exceptions.CancelledError
+
+INFO:     Started server process [6164]
+INFO:     Waiting for application startup.
+2026-02-12 11:21:08,409 - main - INFO - Starting Visual Analytics API...
+2026-02-12 11:21:08,409 - main - INFO - Application startup complete
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)

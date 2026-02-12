@@ -1,0 +1,115 @@
+INFO:     127.0.0.1:56289 - "OPTIONS /api/auth/login HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56289 - "POST /api/auth/login HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53853 - "OPTIONS /api/main_dashboard/exception-heatmap HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60237 - "OPTIONS /api/main_dashboard/exception-heatmap HTTP/1.1" 200 OK
+INFO:     127.0.0.1:63090 - "GET /api/main_dashboard/exception-heatmap HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56289 - "GET /api/main_dashboard/exception_piechart HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49442 - "GET /api/main_dashboard/trend_analysis?range=weekly HTTP/1.1" 200 OK
+INFO:     127.0.0.1:62177 - "GET /api/main_dashboard/bargraph-user-exception-counts HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60237 - "GET /api/main_dashboard/exception-heatmap HTTP/1.1" 200 OK
+INFO:     127.0.0.1:63090 - "GET /api/main_dashboard/exception_piechart HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56289 - "GET /api/main_dashboard/trend_analysis?range=weekly HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49442 - "GET /api/main_dashboard/bargraph-user-exception-counts HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49442 - "GET /api/camera_dashboard/cameras HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56289 - "GET /api/camera_dashboard/live_detection_status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:63090 - "GET /api/camera_dashboard/cameras HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60237 - "GET /api/camera_dashboard/live_detection_status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55548 - "OPTIONS /api/camera_dashboard/start_live_detection HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55548 - "POST /api/camera_dashboard/start_live_detection HTTP/1.1" 200 OK
+WARNING Unable to automatically guess model task, assuming 'task=detect'. Explicitly define task for your model, i.e. 'task=detect', 'segment', 'classify','pose' or 'obb'.
+Loading D:\Visual_Merge_new\visual_analytics_fastapi_backend\app\ML_models\latest_16_1_2026.engine for TensorRT inference...
+INFO:     127.0.0.1:51315 - "GET /api/camera_dashboard/live_detection_feed?camera_id=1 HTTP/1.1" 503 Service Unavailable
+INFO:     127.0.0.1:62283 - "GET /api/camera_dashboard/live_detection_feed?camera_id=2 HTTP/1.1" 503 Service Unavailable
+[02/05/2026-16:15:24] [TRT] [I] Loaded engine size: 9 MiB
+[02/05/2026-16:15:24] [TRT] [I] [MemUsageChange] TensorRT-managed allocation in IExecutionContext creation: CPU +0, GPU +9, now: CPU 0, GPU 14 (MiB)
+[camera_dashboard] GPU: NVIDIA GeForce RTX 3050 | Model: latest_16_1_2026.engine
+[camera_dashboard] Pipeline started | streams: 2 | API: GET /api/camera_dashboard/live_detection_feed?camera_id=N
+INFO:     127.0.0.1:60336 - "GET /api/camera_dashboard/cameras HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53237 - "GET /api/camera_dashboard/live_detection_status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53338 - "GET /api/camera_dashboard/live_detection_status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60336 - "GET /api/camera_dashboard/cameras HTTP/1.1" 200 OK
+[camera_dashboard] FPS: 0.2 | GPU: 118.5 | Dropped: 0
+INFO:     127.0.0.1:58533 - "POST /api/camera_dashboard/start_live_detection HTTP/1.1" 200 OK
+[camera_dashboard] Pipeline started | streams: 2 | API: GET /api/camera_dashboard/live_detection_feed?camera_id=N
+[camera_dashboard] FPS: 27.5 | GPU: 83.3 | Dropped: 0
+INFO:     127.0.0.1:55241 - "GET /api/camera_dashboard/live_detection_feed?camera_id=1 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50122 - "GET /api/camera_dashboard/live_detection_feed?camera_id=2 HTTP/1.1" 200 OK
+[camera_dashboard] FPS: 13.5 | GPU: 62.1 | Dropped: 153
+[camera_dashboard] FPS: 43.0 | GPU: 31.8 | Dropped: 25
+[camera_dashboard] FPS: 51.4 | GPU: 115.4 | Dropped: 225
+[camera_dashboard] FPS: 51.4 | GPU: 60.0 | Dropped: 25
+[camera_dashboard] FPS: 49.8 | GPU: 116.1 | Dropped: 225
+[camera_dashboard] FPS: 49.1 | GPU: 52.8 | Dropped: 24
+INFO:     127.0.0.1:52811 - "OPTIONS /api/camera_dashboard/stop_live_detection HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64130 - "OPTIONS /api/camera_dashboard/stop_live_detection HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52811 - "POST /api/camera_dashboard/stop_live_detection HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64497 - "POST /api/camera_dashboard/stop_live_detection HTTP/1.1" 200 OK
+[camera_dashboard] FPS: 12.2 | GPU: 48.5 | Dropped: 57
+INFO:     127.0.0.1:54892 - "OPTIONS /api/main_dashboard/exception-heatmap HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55378 - "OPTIONS /api/main_dashboard/exception-heatmap HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59292 - "GET /api/main_dashboard/exception-heatmap HTTP/1.1" 200 OK
+INFO:     127.0.0.1:63351 - "GET /api/main_dashboard/bargraph-user-exception-counts HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61375 - "GET /api/main_dashboard/trend_analysis?range=weekly HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50831 - "GET /api/main_dashboard/exception_piechart HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50831 - "GET /api/main_dashboard/exception_piechart HTTP/1.1" 200 OK
+INFO:     127.0.0.1:63351 - "GET /api/main_dashboard/bargraph-user-exception-counts HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55378 - "GET /api/main_dashboard/trend_analysis?range=weekly HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59292 - "GET /api/main_dashboard/exception-heatmap HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59292 - "GET /api/camera_dashboard/cameras HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55378 - "GET /api/camera_dashboard/live_detection_status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:63351 - "GET /api/camera_dashboard/cameras HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55378 - "GET /api/camera_dashboard/live_detection_status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55378 - "GET /api/main_dashboard/exception_piechart HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59292 - "GET /api/main_dashboard/bargraph-user-exception-counts HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50831 - "GET /api/main_dashboard/exception-heatmap HTTP/1.1" 200 OK
+INFO:     127.0.0.1:63351 - "GET /api/main_dashboard/trend_analysis?range=weekly HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55378 - "GET /api/main_dashboard/exception_piechart HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59292 - "GET /api/main_dashboard/bargraph-user-exception-counts HTTP/1.1" 200 OK
+INFO:     127.0.0.1:63351 - "GET /api/main_dashboard/trend_analysis?range=weekly HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61375 - "GET /api/main_dashboard/exception-heatmap HTTP/1.1" 200 OK
+INFO:     127.0.0.1:63351 - "GET /api/camera_dashboard/live_detection_status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61375 - "GET /api/camera_dashboard/cameras HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59292 - "GET /api/camera_dashboard/live_detection_status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61375 - "GET /api/camera_dashboard/cameras HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64317 - "OPTIONS /api/camera_dashboard/start_live_detection HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64317 - "POST /api/camera_dashboard/start_live_detection HTTP/1.1" 200 OK
+WARNING Unable to automatically guess model task, assuming 'task=detect'. Explicitly define task for your model, i.e. 'task=detect', 'segment', 'classify','pose' or 'obb'.
+Loading D:\Visual_Merge_new\visual_analytics_fastapi_backend\app\ML_models\latest_16_1_2026.engine for TensorRT inference...
+INFO:     127.0.0.1:54932 - "GET /api/camera_dashboard/live_detection_feed?camera_id=1 HTTP/1.1" 503 Service Unavailable
+INFO:     127.0.0.1:65360 - "GET /api/camera_dashboard/live_detection_feed?camera_id=2 HTTP/1.1" 503 Service Unavailable
+[02/05/2026-16:50:26] [TRT] [I] Loaded engine size: 9 MiB
+[02/05/2026-16:50:26] [TRT] [I] [MemUsageChange] TensorRT-managed allocation in IExecutionContext creation: CPU +0, GPU +9, now: CPU 0, GPU 14 (MiB)
+[camera_dashboard] GPU: NVIDIA GeForce RTX 3050 | Model: latest_16_1_2026.engine
+[camera_dashboard] Pipeline started | streams: 2 | API: GET /api/camera_dashboard/live_detection_feed?camera_id=N
+INFO:     127.0.0.1:64317 - "GET /api/camera_dashboard/cameras HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60729 - "GET /api/camera_dashboard/live_detection_status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64317 - "GET /api/camera_dashboard/cameras HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60729 - "GET /api/camera_dashboard/live_detection_status HTTP/1.1" 200 OK
+[camera_dashboard] FPS: 0.4 | GPU: 253.4 | Dropped: 0
+INFO:     127.0.0.1:58051 - "POST /api/camera_dashboard/start_live_detection HTTP/1.1" 200 OK
+[camera_dashboard] Pipeline started | streams: 2 | API: GET /api/camera_dashboard/live_detection_feed?camera_id=N
+INFO:     127.0.0.1:59066 - "GET /api/camera_dashboard/live_detection_feed?camera_id=1 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57173 - "GET /api/camera_dashboard/live_detection_feed?camera_id=2 HTTP/1.1" 200 OK
+[camera_dashboard] FPS: 22.0 | GPU: 41.5 | Dropped: 0
+[camera_dashboard] FPS: 36.3 | GPU: 118.4 | Dropped: 155
+[camera_dashboard] FPS: 49.1 | GPU: 104.3 | Dropped: 54
+[camera_dashboard] FPS: 50.2 | GPU: 43.7 | Dropped: 196
+[camera_dashboard] FPS: 49.0 | GPU: 87.9 | Dropped: 55
+[camera_dashboard] FPS: 50.3 | GPU: 78.5 | Dropped: 195
+[camera_dashboard] FPS: 49.0 | GPU: 29.4 | Dropped: 54
+[camera_dashboard] FPS: 50.1 | GPU: 60.2 | Dropped: 196
+[camera_dashboard] FPS: 50.9 | GPU: 58.2 | Dropped: 56
+[camera_dashboard] FPS: 50.1 | GPU: 84.8 | Dropped: 196
+[camera_dashboard] FPS: 49.7 | GPU: 221.9 | Dropped: 54
+[camera_dashboard] FPS: 50.0 | GPU: 39.6 | Dropped: 196
+[camera_dashboard] FPS: 49.5 | GPU: 109.2 | Dropped: 54
+[camera_dashboard] FPS: 50.1 | GPU: 126.0 | Dropped: 196
+[camera_dashboard] FPS: 49.6 | GPU: 58.5 | Dropped: 54
+[camera_dashboard] FPS: 50.1 | GPU: 78.4 | Dropped: 196
+[camera_dashboard] FPS: 50.9 | GPU: 73.9 | Dropped: 56
+[camera_dashboard] FPS: 50.1 | GPU: 120.4 | Dropped: 196
+[camera_dashboard] FPS: 49.1 | GPU: 68.1 | Dropped: 54
+INFO:     127.0.0.1:51617 - "OPTIONS /api/camera_dashboard/stop_live_detection HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50082 - "OPTIONS /api/camera_dashboard/stop_live_detection HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51617 - "POST /api/camera_dashboard/stop_live_detection HTTP/1.1" 200 OK
+INFO:     127.0.0.1:65471 - "POST /api/camera_dashboard/stop_live_detection HTTP/1.1" 200 OK
