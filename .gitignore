@@ -7,3 +7,9 @@ app/utils/__pycache__/*
 app/schemas/__pycache__/*
 app/schemas/__pycache__/*
 logs/*
+
+media/
+logs/
+logs.txt
+__pycache__/
+*.pyc
