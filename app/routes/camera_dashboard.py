@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import cv2
 import time
@@ -6,7 +7,8 @@ import threading
 import queue
 import numpy as np
 from collections import deque
-from typing import Optional, List, Set
+from datetime import datetime
+from typing import Optional, List, Set, Tuple, Any
 from ultralytics import YOLO
 import torch
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
@@ -14,8 +16,10 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import asyncio
 import json
+from sqlalchemy import text
 
 from app.routes.camera_config import CAMERA_CONFIG, get_rtsp_urls
+from app.database.database import SessionLocal
 
 # Add TensorRT DLL search paths before any TensorRT/Ultralytics use (fixes nvinfer_10.dll not found)
 _script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -80,11 +84,55 @@ USER_SELECTION_TO_VIOLATION: dict = {
     "safety_shoes": ["no_safetyshoes"],
 }
 
+# Exception log: violations to insert into employeeinfo.exception_logs (notification feed)
+VIOLATION_CLASSES_FOR_LOG = frozenset({"no_helmet", "no_vest", "no_goggles", "no_safetyshoes"})
+EXCEPTION_LOG_THROTTLE_SECONDS = 180
+EXCEPTION_LOG_QUEUE_SIZE = 32
+exception_log_queue: queue.Queue = queue.Queue(maxsize=EXCEPTION_LOG_QUEUE_SIZE)
+_last_exception_log_time: dict = {}  # (cam_id, exception_type) -> time.time()
+_exception_log_time_lock = threading.Lock()
+
+# Realtime detection JSON queue: per-frame detection summaries for external consumers
+DETECTION_JSON_QUEUE_SIZE = 256
+detection_json_queue: queue.Queue = queue.Queue(maxsize=DETECTION_JSON_QUEUE_SIZE)
+
+# Detection frame storage: save images with detections to media/detection_frames/
+DETECTION_FRAMES_QUEUE_SIZE = 64
+DETECTION_FRAME_THROTTLE_SECONDS = 5
+detection_frames_queue: queue.Queue = queue.Queue(maxsize=DETECTION_FRAMES_QUEUE_SIZE)
+_last_detection_frame_time: dict = {}
+_detection_frame_time_lock = threading.Lock()
+
+# Media dirs (backend project root / media / exception_logs | detection_frames) - use absolute paths
+MEDIA_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "media"))
+EXCEPTION_LOGS_DIR = os.path.abspath(os.path.join(MEDIA_ROOT, "exception_logs"))
+DETECTION_FRAMES_DIR = os.path.abspath(os.path.join(MEDIA_ROOT, "detection_frames"))
+DETECTION_LOG_FILE = os.path.abspath(os.path.join(MEDIA_ROOT, "logs.txt"))
+
+# Counters for debugging (YOLO worker)
+_debug_frames_with_detections = 0
+_debug_batches_processed = 0
+_debug_lock = threading.Lock()
+
 # Stop signal for live detection pipeline
 pipeline_stop_event = threading.Event()
 
 # Ordered camera ids for current pipeline (index = display queue index)
 current_camera_ids: List[str] = []
+
+
+def _ensure_detection_log_file():
+    """
+    Ensure that the plain-text detections log file exists so it is visible
+    even before the first detection is written.
+    """
+    try:
+        os.makedirs(MEDIA_ROOT, exist_ok=True)
+        if not os.path.exists(DETECTION_LOG_FILE):
+            with open(DETECTION_LOG_FILE, "a", encoding="utf-8"):
+                pass
+    except Exception as e:
+        print(f"[camera_dashboard] Failed to ensure detection log file: {e}")
 
 # ======================
 # YOLO MODEL (GPU; loaded on first /start_live_detection, not on import)
@@ -218,6 +266,7 @@ def video_reader(video_path: str, cam_id: int, input_queue: queue.Queue):
 # ======================
 def yolo_batch_worker():
     """Pull from each camera queue in turn; batch inference on GPU; push to display."""
+    global _debug_frames_with_detections, _debug_batches_processed
     batch = []
     meta = []
     frames = []
@@ -269,6 +318,72 @@ def yolo_batch_worker():
                         idx = 0 if nq == 1 else min(cam_id, nq - 1)
                         disp = {"camera_id": cam_id, "frame": frame_copy, "result": res}
                         boxes = res.boxes
+                        # Realtime detection JSON: enqueue per-frame detection summary (all classes)
+                        if boxes is not None and len(boxes) > 0:
+                            names = res.names if hasattr(res, "names") else getattr(model, "names", {})
+                            xyxy_np = boxes.xyxy.cpu().numpy()
+                            cls_np = boxes.cls.cpu().numpy()
+                            conf_np = boxes.conf.cpu().numpy()
+                            detections_json = []
+                            timestamp = datetime.utcnow().isoformat()
+                            for (x1, y1, x2, y2), cls_id, score in zip(xyxy_np, cls_np, conf_np):
+                                cls_idx = int(cls_id)
+                                if isinstance(names, dict):
+                                    raw_name = names.get(cls_idx, str(cls_idx))
+                                else:
+                                    raw_name = names[cls_idx] if 0 <= cls_idx < len(names) else str(cls_idx)
+                                norm_name = (raw_name or "").strip().lower().replace(" ", "_")
+                                is_violation = norm_name in VIOLATION_CLASSES_FOR_LOG
+                                detections_json.append(
+                                    {
+                                        "class_id": cls_idx,
+                                        "class_name": raw_name,
+                                        "normalized_class_name": norm_name,
+                                        "score": float(score),
+                                        "bbox_xyxy": [float(x1), float(y1), float(x2), float(y2)],
+                                        "is_violation": is_violation,
+                                    }
+                                )
+                                # Append to plain-text log only for violation classes (no_helmet, no_vest, no_goggles, no_safetyshoes)
+                                if is_violation:
+                                    try:
+                                        os.makedirs(MEDIA_ROOT, exist_ok=True)
+                                        with open(DETECTION_LOG_FILE, "a", encoding="utf-8") as f:
+                                            f.write(
+                                                f"{timestamp}\t{int(cam_id)}\t{cls_idx}\t{raw_name}\t"
+                                                f"{norm_name}\t{float(score):.4f}\t"
+                                                f"{float(x1):.2f}\t{float(y1):.2f}\t{float(x2):.2f}\t{float(y2):.2f}\t"
+                                                f"1\n"
+                                            )
+                                    except Exception as log_err:
+                                        print(f"[camera_dashboard] detection log write failed: {log_err}")
+                            event = {
+                                "camera_id": int(cam_id),
+                                "timestamp": timestamp,
+                                "detections": detections_json,
+                            }
+                            try:
+                                detection_json_queue.put_nowait(event)
+                            except queue.Full:
+                                try:
+                                    detection_json_queue.get_nowait()
+                                    detection_json_queue.put_nowait(event)
+                                except queue.Empty:
+                                    pass
+                            # Store detection frame to disk (throttled per camera)
+                            now = time.time()
+                            with _detection_frame_time_lock:
+                                last = _last_detection_frame_time.get(cam_id, 0)
+                                if now - last >= DETECTION_FRAME_THROTTLE_SECONDS:
+                                    _last_detection_frame_time[cam_id] = now
+                                    try:
+                                        detection_frames_queue.put_nowait((frame_copy.copy(), res, event, cam_id))
+                                    except queue.Full:
+                                        try:
+                                            detection_frames_queue.get_nowait()
+                                            detection_frames_queue.put_nowait((frame_copy.copy(), res, event, cam_id))
+                                        except queue.Empty:
+                                            pass
                         if len(boxes) > 0 and idx < len(pipeline_output_queues):
                             out_q = pipeline_output_queues[idx]
                             names = res.names if hasattr(res, "names") else getattr(model, "names", {})
@@ -317,13 +432,42 @@ def yolo_batch_worker():
                                     iq.put_nowait(disp)
                                 except queue.Empty:
                                     pass
+                        # Exception log: enqueue violations for DB insert (throttled, non-blocking)
+                        if len(boxes) > 0:
+                            names = res.names if hasattr(res, "names") else getattr(model, "names", {})
+                            cls_np = boxes.cls.cpu().numpy()
+                            seen_violations = set()
+                            for c in cls_np:
+                                name = (names.get(int(c), str(c)) or "").strip().lower().replace(" ", "_")
+                                if name in VIOLATION_CLASSES_FOR_LOG:
+                                    seen_violations.add(name)
+                            if seen_violations:
+                                now = time.time()
+                                time_occurred = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                with _exception_log_time_lock:
+                                    for v in seen_violations:
+                                        key = (cam_id, v)
+                                        last = _last_exception_log_time.get(key, 0)
+                                        if now - last >= EXCEPTION_LOG_THROTTLE_SECONDS:
+                                            _last_exception_log_time[key] = now
+                                            try:
+                                                exception_log_queue.put_nowait((cam_id, frame_copy.copy(), v, time_occurred))
+                                            except queue.Full:
+                                                pass
                     
-                    # Update performance stats
+                    # Update performance stats and debug counters
                     inference_time = time.time() - start_time
                     with stats_lock:
                         performance_stats['batches_processed'] += 1
                         if inference_time > 0:
                             performance_stats['fps'] = len(batch) / inference_time
+                    with _debug_lock:
+                        _debug_batches_processed += 1
+                        for res in results:
+                            if res.boxes is not None and len(res.boxes) > 0:
+                                _debug_frames_with_detections += 1
+                        if _debug_batches_processed % 50 == 0 and _debug_batches_processed > 0:
+                            print(f"[camera_dashboard] DEBUG YOLO: batches={_debug_batches_processed}, frames_with_detections={_debug_frames_with_detections}")
                     
                     # Clear batch
                     batch.clear()
@@ -332,7 +476,7 @@ def yolo_batch_worker():
                     last_batch_time = time.time()
                     
                 except Exception as e:
-                    print(f"YOLO inference error: {e}")
+                    print(f"[camera_dashboard] YOLO inference error: {e}")
                     # Clear batch on error
                     batch.clear()
                     meta.clear()
@@ -341,8 +485,98 @@ def yolo_batch_worker():
                     continue
                     
         except Exception as e:
-            print(f"Batch worker error: {e}")
+            print(f"[camera_dashboard] Batch worker error: {e}")
             continue
+
+
+# ======================
+# DETECTION FRAMES WORKER (save detection images to media/detection_frames/)
+# ======================
+def _detection_frames_worker():
+    """Background thread: save frames with detections to media/detection_frames/ (annotated image + JSON)."""
+    try:
+        os.makedirs(DETECTION_FRAMES_DIR, exist_ok=True)
+        print(f"[camera_dashboard] Detection-frames worker started; saving to: {DETECTION_FRAMES_DIR}")
+    except Exception as e:
+        print(f"[camera_dashboard] detection_frames: ERROR creating dir {DETECTION_FRAMES_DIR}: {e}")
+        return
+    while True:
+        if pipeline_stop_event.is_set():
+            break
+        try:
+            item = detection_frames_queue.get(timeout=1.0)
+        except queue.Empty:
+            continue
+        frame, result, event, cam_id = item
+        if frame is None:
+            continue
+        try:
+            annotated = _annotate_frame(frame, result, filter_by_selected=False) if result is not None else frame
+            ts = event.get("timestamp", datetime.utcnow().isoformat())
+            safe_ts = re.sub(r"[^\d\-T:]", "_", ts)[:26]
+            filename_base = f"detection_{safe_ts}_cam{cam_id}"
+            image_path = os.path.join(DETECTION_FRAMES_DIR, f"{filename_base}.jpg")
+            ok = cv2.imwrite(image_path, annotated)
+            if not ok:
+                print(f"[camera_dashboard] detection_frames: cv2.imwrite returned False for {image_path}")
+                continue
+            json_path = os.path.join(DETECTION_FRAMES_DIR, f"{filename_base}.json")
+            with open(json_path, "w") as f:
+                json.dump(event, f, indent=2)
+            print(f"[camera_dashboard] detection_frames: saved {filename_base}.jpg")
+        except Exception as e:
+            print(f"[camera_dashboard] detection_frames: failed to save: {e}")
+            continue
+
+
+# ======================
+# EXCEPTION LOG WORKER (non-blocking: queue → save image → INSERT exception_logs)
+# ======================
+def _exception_log_worker():
+    """Background thread: consume exception_log_queue, save frame to disk, INSERT into employeeinfo.exception_logs."""
+    try:
+        os.makedirs(EXCEPTION_LOGS_DIR, exist_ok=True)
+        print(f"[camera_dashboard] Exception-log worker started; saving to: {EXCEPTION_LOGS_DIR}")
+    except Exception as e:
+        print(f"[camera_dashboard] exception_log: ERROR creating dir {EXCEPTION_LOGS_DIR}: {e}")
+        return
+    while True:
+        if pipeline_stop_event.is_set():
+            break
+        try:
+            item: Tuple[Any, Any, str, str] = exception_log_queue.get(timeout=1.0)
+        except queue.Empty:
+            continue
+        cam_id, frame, exception_type, time_occurred = item
+        if frame is None or not exception_type:
+            continue
+        safe_type = re.sub(r"[^\w\-]", "_", exception_type)[:32]
+        safe_ts = re.sub(r"[^\d\-]", "_", time_occurred)[:20]
+        filename = f"exception_{safe_ts}_{cam_id}_{safe_type}.jpg"
+        image_path = os.path.join(EXCEPTION_LOGS_DIR, filename)
+        try:
+            cv2.imwrite(image_path, frame)
+            print(f"[camera_dashboard] exception_log: saved image {filename}")
+        except Exception as e:
+            print(f"[camera_dashboard] exception_log: failed to save image: {e}")
+            continue
+        db = SessionLocal()
+        try:
+            db.execute(
+                text("""
+                    INSERT INTO employeeinfo.exception_logs
+                    (time_occurred, Username, Employee_id, Exception_Type, Incident_image)
+                    VALUES (:t, :u, :e, :x, :i)
+                """),
+                {"t": time_occurred, "u": "Unknown", "e": "Unknown", "x": exception_type, "i": image_path},
+            )
+            db.commit()
+            print(f"[camera_dashboard] exception_log: DB insert OK for {exception_type}")
+        except Exception as e:
+            print(f"[camera_dashboard] exception_log: DB insert failed: {e}")
+            db.rollback()
+        finally:
+            db.close()
 
 
 # ======================
@@ -422,22 +656,33 @@ def start_pipeline(
     - Else -> run live RTSP detection (use rtsp_urls if provided, else all from config).
     - class_filter: if None or empty -> show all classes; else only these class names are shown.
     Returns the video thread if video detection is started, otherwise None.
+    Queues are created first so /live_detection_status shows running=true immediately; model loads after.
     """
     global pipeline_input_queues, pipeline_output_queues, pipeline_display_queues, pipeline_imshow_queues, selected_class_names
+    global _debug_frames_with_detections, _debug_batches_processed
     pipeline_stop_event.clear()
+    _debug_frames_with_detections = 0
+    _debug_batches_processed = 0
     selected_class_names = set(c.lower().replace(" ", "_") for c in class_filter) if class_filter else None
-    _ensure_model_loaded()
     urls_to_use = rtsp_urls if rtsp_urls is not None else RTSP_URLS
     video_thread: Optional[threading.Thread] = None
     n_streams = 1 if video_path else len(urls_to_use)
+    if not video_path and not urls_to_use:
+        return None
+    if video_path and not os.path.isfile(video_path):
+        return None
+    # Create queues before model load so /live_detection_status shows running=true immediately
     pipeline_input_queues[:] = [queue.Queue(maxsize=QUEUE_SIZE) for _ in range(n_streams)]
     pipeline_output_queues[:] = [queue.Queue(maxsize=QUEUE_SIZE) for _ in range(n_streams)]
     pipeline_display_queues[:] = [queue.Queue(maxsize=QUEUE_SIZE) for _ in range(n_streams)]
     pipeline_imshow_queues[:] = [queue.Queue(maxsize=QUEUE_SIZE) for _ in range(n_streams)]
 
+    os.makedirs(EXCEPTION_LOGS_DIR, exist_ok=True)
+    os.makedirs(DETECTION_FRAMES_DIR, exist_ok=True)
+
+    _ensure_model_loaded()
+
     if video_path:
-        if not os.path.isfile(video_path):
-            return None
         video_thread = threading.Thread(
             target=video_reader,
             args=(video_path, VIDEO_CAM_ID, pipeline_input_queues[0]),
@@ -446,8 +691,6 @@ def start_pipeline(
         )
         video_thread.start()
     else:
-        if not urls_to_use:
-            return None
         for i, url in enumerate(urls_to_use):
             threading.Thread(
                 target=rtsp_reader,
@@ -456,11 +699,13 @@ def start_pipeline(
                 name=f"RTSP-{i}",
             ).start()
 
-    # Start workers: YOLO → fills display_queues (API); imshow disabled (uncomment next line for local testing only)
+    # Start workers: YOLO → display_queues; exception log → DB; detection frames → disk
     threading.Thread(target=yolo_batch_worker, daemon=True, name="YOLO-Worker").start()
+    threading.Thread(target=_exception_log_worker, daemon=True, name="Exception-Log-Worker").start()
+    threading.Thread(target=_detection_frames_worker, daemon=True, name="Detection-Frames-Worker").start()
     # threading.Thread(target=display_worker, daemon=True, name="Display-Worker").start()
     threading.Thread(target=performance_monitor, daemon=True, name="Performance-Monitor").start()
-    print(f"[camera_dashboard] Pipeline started | streams: {n_streams} | API: GET /api/camera_dashboard/live_detection_feed?camera_id=N")
+    print(f"[camera_dashboard] Pipeline started | streams: {n_streams} | detection images: {DETECTION_FRAMES_DIR} | violations: {EXCEPTION_LOGS_DIR}")
     return video_thread
 
 
@@ -521,6 +766,61 @@ def get_live_detection_status():
         "feed_url_base": "/api/camera_dashboard/live_detection_feed",
         "feed_ws_base": "/api/camera_dashboard/live_detection_feed_ws",
     }
+
+
+@router.get("/debug_storage")
+def debug_storage():
+    """
+    Debug endpoint: storage paths, whether dirs exist, pipeline state, queue sizes, and sample files.
+    Use this to see exactly where the code is broken.
+    """
+    def list_dir_safe(path: str, max_files: int = 20) -> List[str]:
+        try:
+            if not os.path.isdir(path):
+                return []
+            names = sorted(os.listdir(path))[:max_files]
+            return names
+        except Exception:
+            return []
+
+    running = not pipeline_stop_event.is_set() and len(pipeline_display_queues) > 0
+    with _debug_lock:
+        batches = _debug_batches_processed
+        frames_with_det = _debug_frames_with_detections
+    return {
+        "media_root": MEDIA_ROOT,
+        "exception_logs_dir": EXCEPTION_LOGS_DIR,
+        "detection_frames_dir": DETECTION_FRAMES_DIR,
+        "exception_logs_dir_exists": os.path.isdir(EXCEPTION_LOGS_DIR),
+        "detection_frames_dir_exists": os.path.isdir(DETECTION_FRAMES_DIR),
+        "pipeline_running": running,
+        "pipeline_display_queues_count": len(pipeline_display_queues),
+        "exception_log_queue_size": exception_log_queue.qsize(),
+        "detection_frames_queue_size": detection_frames_queue.qsize(),
+        "debug_batches_processed": batches,
+        "debug_frames_with_detections": frames_with_det,
+        "exception_logs_sample_files": list_dir_safe(EXCEPTION_LOGS_DIR),
+        "detection_frames_sample_files": list_dir_safe(DETECTION_FRAMES_DIR),
+    }
+
+
+@router.get("/live_detections_json")
+def get_live_detections_json(max_items: int = 100):
+    """
+    Return and clear up to max_items most recent detection events from the realtime JSON queue.
+    Each event contains camera_id, timestamp, and list of detections with bbox and scores.
+    """
+    items = []
+    taken = 0
+    # Drain the queue up to max_items to provide true queue semantics
+    while taken < max_items:
+        try:
+            event = detection_json_queue.get_nowait()
+        except queue.Empty:
+            break
+        items.append(event)
+        taken += 1
+    return {"count": len(items), "events": items}
 
 
 @router.get("/live_detection_feed")
@@ -757,8 +1057,23 @@ def api_start_live_detection(body: Optional[StartBody] = None):
     global current_camera_ids
     b = body or StartBody()
     video_path = b.video_path
-    # Support both camera_id (single, from frontend) and camera_ids (list)
-    ids = b.camera_ids if (b.camera_ids and len(b.camera_ids) > 0) else ([b.camera_id] if b.camera_id else None)
+    # Create media folders and an empty detections log file immediately
+    # so they exist even if the pipeline thread fails later or no detections occur.
+    try:
+        os.makedirs(EXCEPTION_LOGS_DIR, exist_ok=True)
+        os.makedirs(DETECTION_FRAMES_DIR, exist_ok=True)
+        _ensure_detection_log_file()
+        print(
+            f"[camera_dashboard] Media dirs ready: "
+            f"exception_logs={EXCEPTION_LOGS_DIR}, "
+            f"detection_frames={DETECTION_FRAMES_DIR}, "
+            f"detection_log_file={DETECTION_LOG_FILE}"
+        )
+    except Exception as e:
+        print(f"[camera_dashboard] ERROR creating media dirs or log file: {e}")
+    # Support both camera_id (single, from frontend) and camera_ids (list); normalize to strings for config lookup
+    raw_ids = b.camera_ids if (b.camera_ids and len(b.camera_ids) > 0) else ([b.camera_id] if b.camera_id else None)
+    ids = [str(i) for i in raw_ids] if raw_ids else None
     rtsp_urls = None if video_path else get_rtsp_urls(ids)
     if video_path:
         current_camera_ids = ["0"]
@@ -766,7 +1081,12 @@ def api_start_live_detection(body: Optional[StartBody] = None):
         current_camera_ids = list(ids) if ids else sorted(
             [k for k in CAMERA_CONFIG if CAMERA_CONFIG[k].get("type") == "rtsp" and CAMERA_CONFIG[k].get("url")]
         )
-    threading.Thread(target=lambda: start_pipeline(video_path, rtsp_urls, b.classes), daemon=True).start()
+    def _run_pipeline():
+        try:
+            start_pipeline(video_path, rtsp_urls, b.classes)
+        except Exception as e:
+            print(f"[camera_dashboard] Pipeline thread ERROR: {e}")
+    threading.Thread(target=_run_pipeline, daemon=True).start()
     # Feed URL for selected camera (single-cam: first in list)
     feed_camera_id = current_camera_ids[0] if current_camera_ids else "0"
     feed_url = f"/api/camera_dashboard/live_detection_feed?camera_id={feed_camera_id}"
