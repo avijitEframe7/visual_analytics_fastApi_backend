@@ -20,6 +20,7 @@ from sqlalchemy import text
 
 from app.routes.camera_config import CAMERA_CONFIG, get_rtsp_urls
 from app.database.database import SessionLocal
+from app.routes.email_feature import enqueue_violation_email
 
 # Add TensorRT DLL search paths before any TensorRT/Ultralytics use (fixes nvinfer_10.dll not found)
 _script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -451,7 +452,9 @@ def yolo_batch_worker():
                                         if now - last >= EXCEPTION_LOG_THROTTLE_SECONDS:
                                             _last_exception_log_time[key] = now
                                             try:
-                                                exception_log_queue.put_nowait((cam_id, frame_copy.copy(), v, time_occurred))
+                                                # Draw violation boxes here (result is valid); worker only saves this image
+                                                annotated_frame = _annotate_frame_for_exception(frame_copy.copy(), res, v)
+                                                exception_log_queue.put_nowait((cam_id, annotated_frame, v, time_occurred))
                                             except queue.Full:
                                                 pass
                     
@@ -533,7 +536,7 @@ def _detection_frames_worker():
 # EXCEPTION LOG WORKER (non-blocking: queue → save image → INSERT exception_logs)
 # ======================
 def _exception_log_worker():
-    """Background thread: consume exception_log_queue, save frame to disk, INSERT into employeeinfo.exception_logs."""
+    """Background thread: consume exception_log_queue, save annotated frame (with violation boxes) to disk, INSERT into employeeinfo.exception_logs."""
     try:
         os.makedirs(EXCEPTION_LOGS_DIR, exist_ok=True)
         print(f"[camera_dashboard] Exception-log worker started; saving to: {EXCEPTION_LOGS_DIR}")
@@ -544,10 +547,11 @@ def _exception_log_worker():
         if pipeline_stop_event.is_set():
             break
         try:
-            item: Tuple[Any, Any, str, str] = exception_log_queue.get(timeout=1.0)
+            item = exception_log_queue.get(timeout=1.0)
         except queue.Empty:
             continue
-        cam_id, frame, exception_type, time_occurred = item
+        # (cam_id, annotated_frame, exception_type, time_occurred) - frame is already drawn in inference loop
+        cam_id, frame, exception_type, time_occurred = item[0], item[1], item[2], item[3]
         if frame is None or not exception_type:
             continue
         safe_type = re.sub(r"[^\w\-]", "_", exception_type)[:32]
@@ -556,7 +560,7 @@ def _exception_log_worker():
         image_path = os.path.join(EXCEPTION_LOGS_DIR, filename)
         try:
             cv2.imwrite(image_path, frame)
-            print(f"[camera_dashboard] exception_log: saved image {filename}")
+            print(f"[camera_dashboard] exception_log: saved image {filename} (with violation boxes)")
         except Exception as e:
             print(f"[camera_dashboard] exception_log: failed to save image: {e}")
             continue
@@ -572,6 +576,17 @@ def _exception_log_worker():
             )
             db.commit()
             print(f"[camera_dashboard] exception_log: DB insert OK for {exception_type}")
+            # Enqueue an email notification; this is non-blocking (just adds to a queue).
+            try:
+                enqueue_violation_email(
+                    camera_id=int(cam_id),
+                    exception_type=exception_type,
+                    image_path=image_path,
+                    time_occurred=time_occurred,
+                )
+            except Exception as e:
+                # Do not break logging if email enqueue fails.
+                print(f"[camera_dashboard] exception_log: failed to enqueue email: {e}")
         except Exception as e:
             print(f"[camera_dashboard] exception_log: DB insert failed: {e}")
             db.rollback()
@@ -894,6 +909,38 @@ def _class_matches_selected(cls_name: str) -> bool:
         if v in cls_n or cls_n in v:
             return True
     return False
+
+
+def _annotate_frame_for_exception(frame, result, exception_type: str):
+    """
+    Draw only violation-class boxes on the frame so the emailed/exception image
+    clearly shows what was violated. Violation boxes are drawn in RED with
+    a 'VIOLATION: <type>' label so the receiver can understand from the photo.
+    """
+    annotated = frame.copy() if frame is not None else frame
+    if annotated is None or result is None:
+        return annotated
+    boxes = result.boxes
+    if boxes is None or len(boxes) == 0:
+        return annotated
+    xyxy = boxes.xyxy.cpu().numpy()
+    confs = boxes.conf.cpu().numpy()
+    classes = boxes.cls.cpu().numpy().astype(int)
+    names = result.names if hasattr(result, "names") else getattr(model, "names", {})
+    for (x1, y1, x2, y2), conf, cls_id in zip(xyxy, confs, classes):
+        cls_idx = int(cls_id)
+        raw = names.get(cls_idx, str(cls_idx)) if isinstance(names, dict) else (names[cls_idx] if cls_idx < len(names) else str(cls_idx))
+        norm_name = (raw or "").strip().lower().replace(" ", "_")
+        if norm_name not in VIOLATION_CLASSES_FOR_LOG:
+            continue
+        x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
+        label = f"VIOLATION: {norm_name} ({conf:.2f})"
+        color = (0, 0, 255)  # BGR red
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 3)
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        cv2.rectangle(annotated, (x1, y1 - th - 8), (x1 + tw + 4, y1), color, -1)
+        cv2.putText(annotated, label, (x1 + 2, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+    return annotated
 
 
 def _annotate_frame(frame, result, filter_by_selected=True):
