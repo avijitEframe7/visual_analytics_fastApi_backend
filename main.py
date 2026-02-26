@@ -13,7 +13,8 @@ from app.routes import (
     camera_dashboard, 
     model_management, 
     camera_management, 
-    notification_management
+    notification_management,
+    email_feature,
 )
 
 # Configure logging
@@ -66,6 +67,7 @@ app.include_router(camera_dashboard.router)
 app.include_router(model_management.router)
 app.include_router(camera_management.router)
 app.include_router(notification_management.router)
+app.include_router(email_feature.router)
 
 # Root endpoint
 @app.get("/")
