@@ -21,10 +21,10 @@ CAMERA_CONFIG = {
 
 
 def get_rtsp_urls(ids=None):
-    """ids=None -> all RTSP (sorted); else URLs for given ids only."""
+    """ids=None -> all RTSP (sorted); else URLs for given ids only. Keys normalized to string for lookup."""
     if ids is None:
         return [c["url"] for k in sorted(CAMERA_CONFIG) if (c := CAMERA_CONFIG[k]).get("type") == "rtsp" and c.get("url")]
-    return [CAMERA_CONFIG[k]["url"] for k in ids if k in CAMERA_CONFIG and (c := CAMERA_CONFIG[k]).get("type") == "rtsp" and c.get("url")]
+    return [CAMERA_CONFIG[str(k)]["url"] for k in ids if str(k) in CAMERA_CONFIG and (c := CAMERA_CONFIG[str(k)]).get("type") == "rtsp" and c.get("url")]
 
 
 CAMERA_TYPES = {
