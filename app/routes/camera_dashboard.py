@@ -12,7 +12,7 @@ from typing import Any, List, Optional, Set, Tuple
 import cv2
 import numpy as np
 import torch
-from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import text
@@ -21,6 +21,7 @@ from ultralytics import YOLO
 from app.database.database import SessionLocal
 from app.routes.camera_config import CAMERA_CONFIG, get_rtsp_urls
 from app.routes.email_feature import enqueue_violation_email
+from app.security.rbac import decode_access_token, get_role_allowed_page_keys, require_permission
 
 # Add TensorRT DLL search paths before any TensorRT/Ultralytics use (fixes nvinfer_10.dll not found)
 _script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -766,7 +767,11 @@ def start_pipeline(
 # -----------------------------------------------------------------------------
 # FastAPI router (included from main.py)
 # -----------------------------------------------------------------------------
-router = APIRouter(prefix="/api/camera_dashboard", tags=["camera_dashboard"])
+router = APIRouter(
+    prefix="/api/camera_dashboard",
+    tags=["camera_dashboard"],
+    dependencies=[Depends(require_permission("camera-dashboard.view"))],
+)
 
 
 @router.get("/cameras")
@@ -927,6 +932,35 @@ async def live_detection_feed_ws(websocket: WebSocket, camera_id: str = "0"):
     - If client sends {"mode": "webrtc"}, perform WebRTC signaling (offer/answer) and stream via WebRTC (requires aiortc).
     - Otherwise stream JPEG frames as binary for low-latency canvas rendering.
     """
+    # Auth for WebSocket clients: since browsers can't set Authorization headers reliably,
+    # we accept `?token=...` (preferred) and validate it before streaming.
+    raw_token = websocket.query_params.get("token")
+    if not raw_token:
+        auth = websocket.headers.get("authorization")
+        if auth and auth.lower().startswith("bearer "):
+            raw_token = auth.split(" ", 1)[1].strip()
+
+    if not raw_token:
+        await websocket.close(code=4401)
+        return
+
+    try:
+        decoded = decode_access_token(raw_token)
+        role = (decoded.get("role") or "").strip().lower()
+    except Exception:
+        await websocket.close(code=4401)
+        return
+
+    db = SessionLocal()
+    try:
+        allowed_keys = get_role_allowed_page_keys(db=db, role=role)
+    finally:
+        db.close()
+
+    if "camera-dashboard.view" not in allowed_keys and role != "admin":
+        await websocket.close(code=4403)
+        return
+
     await websocket.accept()
     if pipeline_stop_event.is_set() or not pipeline_display_queues:
         await websocket.send_json({"error": "Live detection not running"})
@@ -1044,7 +1078,10 @@ async def live_detection_feed_ws(websocket: WebSocket, camera_id: str = "0"):
             pass
 
 
-@router.post("/start_live_detection")
+@router.post(
+    "/start_live_detection",
+    dependencies=[Depends(require_permission("camera-dashboard.control"))],
+)
 def api_start_live_detection(body: Optional[StartBody] = None):
     """Start: body.camera_id (single) or body.camera_ids for chosen RTSP (omit = all); body.classes to filter by class (omit = all)."""
     global current_camera_ids
@@ -1089,7 +1126,10 @@ def api_start_live_detection(body: Optional[StartBody] = None):
     }
 
 
-@router.post("/stop_live_detection")
+@router.post(
+    "/stop_live_detection",
+    dependencies=[Depends(require_permission("camera-dashboard.control"))],
+)
 def api_stop_live_detection():
     """Signal the live detection pipeline to stop; workers will exit and display windows close."""
     pipeline_stop_event.set()

@@ -6,8 +6,13 @@ from sqlalchemy import text
 from typing import Any
 
 from app.database.database import get_db
+from app.security.rbac import require_permission
 
-router = APIRouter(prefix="/api/notification_management", tags=["notification_management"])
+router = APIRouter(
+    prefix="/api/notification_management",
+    tags=["notification_management"],
+    dependencies=[Depends(require_permission("notifications.view"))],
+)
 
 
 def _decode_bytes(val: Any) -> str:

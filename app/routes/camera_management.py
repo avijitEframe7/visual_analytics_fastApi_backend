@@ -4,8 +4,13 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 
 from app.database.database import get_db
+from app.security.rbac import require_permission
 
-router = APIRouter(prefix="/api/camera_management", tags=["camera_management"])
+router = APIRouter(
+    prefix="/api/camera_management",
+    tags=["camera_management"],
+    dependencies=[Depends(require_permission("camera-management.view"))],
+)
 
 
 @router.get("/cameras")
