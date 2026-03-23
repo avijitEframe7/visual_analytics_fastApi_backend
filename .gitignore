@@ -11,3 +11,5 @@ logs/*
 media/
 logs/
 logs.txt
+ML_models/
+testing
