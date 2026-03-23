@@ -41,6 +41,7 @@ SessionLocal = sessionmaker(
 # All ORM models inherit from Base so SQLAlchemy can create tables and map rows
 Base = declarative_base()
 
+
 def get_db():
     db = SessionLocal()
     try:
