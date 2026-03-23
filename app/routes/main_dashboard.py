@@ -9,6 +9,7 @@ import io
 
 from fastapi.responses import StreamingResponse
 from app.database.database import get_db
+from app.security.rbac import require_permission
 
 # Helper functions
 def decode_bytes(val: Any) -> str:
@@ -29,7 +30,8 @@ def safe_datetime_str(val: Any) -> str:
 
 router = APIRouter(
     prefix="/api/main_dashboard",
-    tags=["Main Dashboard"]
+    tags=["Main Dashboard"],
+    dependencies=[Depends(require_permission("dashboard.view"))],
 )
 
 @router.get("/trend_analysis")

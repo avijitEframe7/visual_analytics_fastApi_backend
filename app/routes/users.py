@@ -2,8 +2,9 @@ from fastapi import Depends, APIRouter
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from app.database.database import get_db   # IMPORTANT
+from app.security.rbac import require_role
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_role("admin"))])
 
 @router.get("/get_users")
 # def get_users(db = Depends(get_db)):

@@ -6,10 +6,16 @@ import queue
 from typing import Optional, Dict, Any, List
 from email.message import EmailMessage
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
+
+from app.security.rbac import require_role
 
 
-router = APIRouter(prefix="/api/email", tags=["email"])
+router = APIRouter(
+    prefix="/api/email",
+    tags=["email"],
+    dependencies=[Depends(require_role("admin"))],
+)
 
 
 # ======================

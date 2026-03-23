@@ -4,8 +4,13 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 
 from app.database.database import get_db
+from app.security.rbac import require_permission
 
-router = APIRouter(prefix="/api/model_management", tags=["model_management"])
+router = APIRouter(
+    prefix="/api/model_management",
+    tags=["model_management"],
+    dependencies=[Depends(require_permission("model-management.view"))],
+)
 
 
 @router.get("/models")

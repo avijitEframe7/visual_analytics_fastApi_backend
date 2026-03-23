@@ -6,16 +6,21 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.routes import (
-    users, 
-    health, 
-    auth, 
-    main_dashboard, 
-    camera_dashboard, 
-    model_management, 
-    camera_management, 
+    users,
+    health,
+    auth,
+    main_dashboard,
+    camera_dashboard,
+    model_management,
+    camera_management,
     notification_management,
     email_feature,
 )
+
+from app.database.database import Base, engine, SessionLocal
+from app.security.rbac import seed_default_role_page_permissions
+from app.models.admins import Admin  # noqa: F401 (ensure model is registered in metadata)
+from app.models.role_page_permissions import RolePagePermission  # noqa: F401
 
 # Configure logging
 log_dir = Path("logs")
@@ -48,12 +53,25 @@ app.add_middleware(
 )
 
 # Startup event
+
+
 @app.on_event("startup")
 async def startup_event():
     logger.info("Starting Visual Analytics API...")
+    # Ensure RBAC tables exist (dev-friendly) and seed default role permissions.
+    # In production, prefer migrations instead of auto-creating tables.
+    Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+    try:
+        seed_default_role_page_permissions(db)
+        logger.info("RBAC role/page permissions seeded")
+    finally:
+        db.close()
     logger.info("Application startup complete")
 
 # Shutdown event
+
+
 @app.on_event("shutdown")
 async def shutdown_event():
     logger.info("Shutting down Visual Analytics API...")
@@ -70,6 +88,8 @@ app.include_router(notification_management.router)
 app.include_router(email_feature.router)
 
 # Root endpoint
+
+
 @app.get("/")
 async def root():
     return {
