@@ -1,25 +1,25 @@
+import asyncio
+import json
 import os
+import queue
 import re
 import sys
-import cv2
-import time
 import threading
-import queue
-import numpy as np
-from collections import deque
+import time
 from datetime import datetime
-from typing import Optional, List, Set, Tuple, Any
-from ultralytics import YOLO
+from typing import Any, List, Optional, Set, Tuple
+
+import cv2
+import numpy as np
 import torch
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-import asyncio
-import json
 from sqlalchemy import text
+from ultralytics import YOLO
 
-from app.routes.camera_config import CAMERA_CONFIG, get_rtsp_urls
 from app.database.database import SessionLocal
+from app.routes.camera_config import CAMERA_CONFIG, get_rtsp_urls
 from app.routes.email_feature import enqueue_violation_email
 
 # Add TensorRT DLL search paths before any TensorRT/Ultralytics use (fixes nvinfer_10.dll not found)
@@ -37,10 +37,9 @@ for _p in _trt_paths:
         os.environ["PATH"] = _p + os.pathsep + os.environ.get("PATH", "")
 
 
-
-# ======================
-# CONFIG
-# ======================
+# -----------------------------------------------------------------------------
+# Config: streams, inference tuning, reconnect
+# -----------------------------------------------------------------------------
 RTSP_URLS = get_rtsp_urls()
 
 # FPS / throughput: skip every Nth frame; resize before inference
@@ -53,9 +52,9 @@ SINGLE_STREAM_BATCH_TIMEOUT = 0.05  # (s) much shorter so single-camera doesn't 
 MAX_RECONNECT_ATTEMPTS = 5
 RECONNECT_DELAY = 2
 
-# ======================
-# QUEUES & LOCKS (all per-camera for max optimization)
-# ======================
+# -----------------------------------------------------------------------------
+# Pipeline state: per-camera queues, locks, stats, filters
+# -----------------------------------------------------------------------------
 stats_lock = threading.Lock()
 pipeline_input_queues: List[queue.Queue] = []
 pipeline_output_queues: List[queue.Queue] = []
@@ -104,7 +103,7 @@ detection_frames_queue: queue.Queue = queue.Queue(maxsize=DETECTION_FRAMES_QUEUE
 _last_detection_frame_time: dict = {}
 _detection_frame_time_lock = threading.Lock()
 
-# Media dirs (backend project root / media / exception_logs | detection_frames) - use absolute paths
+# Media dirs: <backend>/media/{exception_logs,detection_frames,logs.txt}
 MEDIA_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "media"))
 EXCEPTION_LOGS_DIR = os.path.abspath(os.path.join(MEDIA_ROOT, "exception_logs"))
 DETECTION_FRAMES_DIR = os.path.abspath(os.path.join(MEDIA_ROOT, "detection_frames"))
@@ -135,9 +134,9 @@ def _ensure_detection_log_file():
     except Exception as e:
         print(f"[camera_dashboard] Failed to ensure detection log file: {e}")
 
-# ======================
-# YOLO MODEL (GPU; loaded on first /start_live_detection, not on import)
-# ======================
+# -----------------------------------------------------------------------------
+# YOLO model (GPU; loaded on first /start_live_detection, not on import)
+# -----------------------------------------------------------------------------
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "ML_models", "latest_16_1_2026.engine"))
 model = None
@@ -168,9 +167,105 @@ def _ensure_model_loaded():
             raise
     print(f"[camera_dashboard] GPU: {gpu_name} | Model: {os.path.basename(MODEL_PATH)}")
 
-# ======================
-# OPTIMIZED RTSP READER
-# ======================
+
+# -----------------------------------------------------------------------------
+# Class filter & frame annotation (shared by YOLO worker, display, HTTP/WebSocket)
+# -----------------------------------------------------------------------------
+def _get_effective_violation_names() -> Set[str]:
+    """User selects PPE type (e.g. Helmet) = show VIOLATIONS (NO_helmet). Returns normalized model class names to show."""
+    if not selected_class_names:
+        return set()
+    out: Set[str] = set()
+    for sel in selected_class_names:
+        sel_n = (sel or "").lower().replace(" ", "_")
+        if sel_n in USER_SELECTION_TO_VIOLATION:
+            for v in USER_SELECTION_TO_VIOLATION[sel_n]:
+                out.add(v.lower().replace(" ", "_"))
+        else:
+            out.add(sel_n)
+    return out
+
+
+def _class_matches_selected(cls_name: str) -> bool:
+    """True if normalized model class name is one of the violation classes to show (PPE selection → NO_*)."""
+    if not selected_class_names or not cls_name:
+        return True
+    cls_n = (cls_name or "").lower().replace(" ", "_")
+    effective = _get_effective_violation_names()
+    if cls_n in effective:
+        return True
+    for v in effective:
+        if v in cls_n or cls_n in v:
+            return True
+    return False
+
+
+def _annotate_frame_for_exception(frame, result, exception_type: str):
+    """
+    Draw only violation-class boxes on the frame so the emailed/exception image
+    clearly shows what was violated. Violation boxes are drawn in RED with
+    a 'VIOLATION: <type>' label so the receiver can understand from the photo.
+    """
+    annotated = frame.copy() if frame is not None else frame
+    if annotated is None or result is None:
+        return annotated
+    boxes = result.boxes
+    if boxes is None or len(boxes) == 0:
+        return annotated
+    xyxy = boxes.xyxy.cpu().numpy()
+    confs = boxes.conf.cpu().numpy()
+    classes = boxes.cls.cpu().numpy().astype(int)
+    names = result.names if hasattr(result, "names") else getattr(model, "names", {})
+    for (x1, y1, x2, y2), conf, cls_id in zip(xyxy, confs, classes):
+        cls_idx = int(cls_id)
+        raw = names.get(cls_idx, str(cls_idx)) if isinstance(names, dict) else (names[cls_idx] if cls_idx < len(names) else str(cls_idx))
+        norm_name = (raw or "").strip().lower().replace(" ", "_")
+        if norm_name not in VIOLATION_CLASSES_FOR_LOG:
+            continue
+        x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
+        label = f"VIOLATION: {norm_name} ({conf:.2f})"
+        color = (0, 0, 255)  # BGR red
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 3)
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        cv2.rectangle(annotated, (x1, y1 - th - 8), (x1 + tw + 4, y1), color, -1)
+        cv2.putText(annotated, label, (x1 + 2, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+    return annotated
+
+
+def _annotate_frame(frame, result, filter_by_selected=True):
+    """
+    Draw detection boxes on frame. Uses result from DISPLAY queue (full YOLO result with .boxes).
+    When filter_by_selected=True, only draws classes in selected_class_names (from start_live_detection).
+    Uses flexible matching so model names (e.g. vest, safety_shoes) match frontend ids (safety_vest, shoes).
+    """
+    annotated = frame.copy()
+    if result is None:
+        return annotated
+    boxes = result.boxes
+    if boxes is None or len(boxes) == 0:
+        return annotated
+    xyxy = boxes.xyxy.cpu().numpy()
+    confs = boxes.conf.cpu().numpy()
+    classes = boxes.cls.cpu().numpy().astype(int)
+    names = result.names if hasattr(result, "names") else getattr(model, "names", {})
+    for (x1, y1, x2, y2), conf, cls_id in zip(xyxy, confs, classes):
+        if filter_by_selected and selected_class_names:
+            raw = names.get(cls_id, str(cls_id)) if isinstance(names, dict) else (names[cls_id] if cls_id < len(names) else str(cls_id))
+            cls_name = (raw or "").strip()
+            if not _class_matches_selected(cls_name):
+                continue
+        x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
+        label = f"{names.get(cls_id, str(cls_id))} {conf:.2f}" if isinstance(names, dict) else f"{cls_id} {conf:.2f}"
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        cv2.rectangle(annotated, (x1, y1 - th - 4), (x1 + tw, y1), (0, 255, 0), -1)
+        cv2.putText(annotated, label, (x1, y1 - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+    return annotated
+
+
+# -----------------------------------------------------------------------------
+# Input readers (RTSP and video file)
+# -----------------------------------------------------------------------------
 def rtsp_reader(rtsp_url: str, cam_id: int, input_queue: queue.Queue):
     """RTSP reader: feeds only this camera's queue (per-camera, no cross-cam blocking)."""
     cap = None
@@ -226,45 +321,9 @@ def rtsp_reader(rtsp_url: str, cam_id: int, input_queue: queue.Queue):
             time.sleep(RECONNECT_DELAY)
 
 
-# ======================
-# VIDEO FILE READER
-# ======================
-def video_reader(video_path: str, cam_id: int, input_queue: queue.Queue):
-    """Video file reader: feeds single queue until end of file."""
-    if not os.path.isfile(video_path):
-        return
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        return
-    frame_count = 0
-    while True:
-        if pipeline_stop_event.is_set():
-            cap.release()
-            return
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frame_count += 1
-        if frame_count % FRAME_SKIP != 0:
-            continue
-        if frame.shape[:2] != RESIZE[::-1]:
-            frame = cv2.resize(frame, RESIZE, interpolation=cv2.INTER_LINEAR)
-        try:
-            input_queue.put_nowait((cam_id, frame))
-        except queue.Full:
-            try:
-                input_queue.get_nowait()
-                input_queue.put_nowait((cam_id, frame))
-                with stats_lock:
-                    performance_stats["frames_dropped"] += 1
-            except queue.Empty:
-                pass
-    cap.release()
-
-
-# ======================
-# YOLO WORKER (round-robin per-cam input → GPU → per-cam output/display queues)
-# ======================
+# -----------------------------------------------------------------------------
+# YOLO batch worker (round-robin per-cam → GPU → per-cam output/display queues)
+# -----------------------------------------------------------------------------
 def yolo_batch_worker():
     """Pull from each camera queue in turn; batch inference on GPU; push to display."""
     global _debug_frames_with_detections, _debug_batches_processed
@@ -492,9 +551,9 @@ def yolo_batch_worker():
             continue
 
 
-# ======================
-# DETECTION FRAMES WORKER (save detection images to media/detection_frames/)
-# ======================
+# -----------------------------------------------------------------------------
+# Detection-frames worker (save annotated frames + JSON under media/detection_frames/)
+# -----------------------------------------------------------------------------
 def _detection_frames_worker():
     """Background thread: save frames with detections to media/detection_frames/ (annotated image + JSON)."""
     try:
@@ -532,9 +591,9 @@ def _detection_frames_worker():
             continue
 
 
-# ======================
-# EXCEPTION LOG WORKER (non-blocking: queue → save image → INSERT exception_logs)
-# ======================
+# -----------------------------------------------------------------------------
+# Exception-log worker (queue → disk → DB + email enqueue)
+# -----------------------------------------------------------------------------
 def _exception_log_worker():
     """Background thread: consume exception_log_queue, save annotated frame (with violation boxes) to disk, INSERT into employeeinfo.exception_logs."""
     try:
@@ -594,9 +653,9 @@ def _exception_log_worker():
             db.close()
 
 
-# ======================
-# DISPLAY (imshow) – uses pipeline_imshow_queues only; does not affect live_detection_feed API
-# ======================
+# -----------------------------------------------------------------------------
+# Display (imshow) — pipeline_imshow_queues only; does not affect live_detection_feed
+# -----------------------------------------------------------------------------
 def display_worker():
     """Read per-camera imshow queues, draw boxes via _annotate_frame, cv2.imshow per camera."""
     latest_frames = {}
@@ -636,9 +695,9 @@ def display_worker():
     cv2.destroyAllWindows()
 
 
-# ======================
-# PERFORMANCE (terminal: pipeline FPS, GPU inference FPS, dropped)
-# ======================
+# -----------------------------------------------------------------------------
+# Performance monitor (terminal: pipeline FPS, GPU FPS, dropped frames)
+# -----------------------------------------------------------------------------
 def performance_monitor():
     """Print minimal stats to terminal every 5s."""
     while True:
@@ -657,20 +716,13 @@ def performance_monitor():
         performance_stats['last_update'] = time.time()
 
 
-VIDEO_CAM_ID = len(RTSP_URLS)  # virtual camera id used for video files
-
-
 def start_pipeline(
-    video_path: Optional[str] = None,
     rtsp_urls: Optional[List[str]] = None,
     class_filter: Optional[List[str]] = None,
-) -> Optional[threading.Thread]:
+) -> None:
     """
-    Start the detection pipeline.
-    - If video_path is provided and valid -> run video detection.
-    - Else -> run live RTSP detection (use rtsp_urls if provided, else all from config).
-    - class_filter: if None or empty -> show all classes; else only these class names are shown.
-    Returns the video thread if video detection is started, otherwise None.
+    Start live RTSP detection (use rtsp_urls if provided, else all from config).
+    class_filter: if None or empty -> show all classes; else only these class names are shown.
     Queues are created first so /live_detection_status shows running=true immediately; model loads after.
     """
     global pipeline_input_queues, pipeline_output_queues, pipeline_display_queues, pipeline_imshow_queues, selected_class_names
@@ -680,12 +732,9 @@ def start_pipeline(
     _debug_batches_processed = 0
     selected_class_names = set(c.lower().replace(" ", "_") for c in class_filter) if class_filter else None
     urls_to_use = rtsp_urls if rtsp_urls is not None else RTSP_URLS
-    video_thread: Optional[threading.Thread] = None
-    n_streams = 1 if video_path else len(urls_to_use)
-    if not video_path and not urls_to_use:
-        return None
-    if video_path and not os.path.isfile(video_path):
-        return None
+    if not urls_to_use:
+        return
+    n_streams = len(urls_to_use)
     # Create queues before model load so /live_detection_status shows running=true immediately
     pipeline_input_queues[:] = [queue.Queue(maxsize=QUEUE_SIZE) for _ in range(n_streams)]
     pipeline_output_queues[:] = [queue.Queue(maxsize=QUEUE_SIZE) for _ in range(n_streams)]
@@ -697,22 +746,13 @@ def start_pipeline(
 
     _ensure_model_loaded()
 
-    if video_path:
-        video_thread = threading.Thread(
-            target=video_reader,
-            args=(video_path, VIDEO_CAM_ID, pipeline_input_queues[0]),
+    for i, url in enumerate(urls_to_use):
+        threading.Thread(
+            target=rtsp_reader,
+            args=(url, i, pipeline_input_queues[i]),
             daemon=True,
-            name="Video-Reader",
-        )
-        video_thread.start()
-    else:
-        for i, url in enumerate(urls_to_use):
-            threading.Thread(
-                target=rtsp_reader,
-                args=(url, i, pipeline_input_queues[i]),
-                daemon=True,
-                name=f"RTSP-{i}",
-            ).start()
+            name=f"RTSP-{i}",
+        ).start()
 
     # Start workers: YOLO → display_queues; exception log → DB; detection frames → disk
     threading.Thread(target=yolo_batch_worker, daemon=True, name="YOLO-Worker").start()
@@ -721,12 +761,11 @@ def start_pipeline(
     # threading.Thread(target=display_worker, daemon=True, name="Display-Worker").start()
     threading.Thread(target=performance_monitor, daemon=True, name="Performance-Monitor").start()
     print(f"[camera_dashboard] Pipeline started | streams: {n_streams} | detection images: {DETECTION_FRAMES_DIR} | violations: {EXCEPTION_LOGS_DIR}")
-    return video_thread
 
 
-# ======================
-# FASTAPI ROUTER (entry from main.py)
-# ======================
+# -----------------------------------------------------------------------------
+# FastAPI router (included from main.py)
+# -----------------------------------------------------------------------------
 router = APIRouter(prefix="/api/camera_dashboard", tags=["camera_dashboard"])
 
 
@@ -752,7 +791,6 @@ def get_cameras():
 
 
 class StartBody(BaseModel):
-    video_path: Optional[str] = None
     camera_id: Optional[str] = None  # single camera (frontend sends this)
     camera_ids: Optional[List[str]] = None  # omit = all RTSP
     classes: Optional[List[str]] = None  # omit or empty = show all; else only these class names (e.g. helmet, shoes)
@@ -882,98 +920,6 @@ async def live_detection_feed(camera_id: str = "0", quality: int = 82, draw_all_
     )
 
 
-def _get_effective_violation_names() -> Set[str]:
-    """User selects PPE type (e.g. Helmet) = show VIOLATIONS (NO_helmet). Returns set of normalized model class names to show."""
-    if not selected_class_names:
-        return set()
-    out: Set[str] = set()
-    for sel in selected_class_names:
-        sel_n = (sel or "").lower().replace(" ", "_")
-        if sel_n in USER_SELECTION_TO_VIOLATION:
-            for v in USER_SELECTION_TO_VIOLATION[sel_n]:
-                out.add(v.lower().replace(" ", "_"))
-        else:
-            out.add(sel_n)
-    return out
-
-
-def _class_matches_selected(cls_name: str) -> bool:
-    """True if normalized model class name is one of the violation classes we want to show (user selected PPE = show NO_*)."""
-    if not selected_class_names or not cls_name:
-        return True
-    cls_n = (cls_name or "").lower().replace(" ", "_")
-    effective = _get_effective_violation_names()
-    if cls_n in effective:
-        return True
-    for v in effective:
-        if v in cls_n or cls_n in v:
-            return True
-    return False
-
-
-def _annotate_frame_for_exception(frame, result, exception_type: str):
-    """
-    Draw only violation-class boxes on the frame so the emailed/exception image
-    clearly shows what was violated. Violation boxes are drawn in RED with
-    a 'VIOLATION: <type>' label so the receiver can understand from the photo.
-    """
-    annotated = frame.copy() if frame is not None else frame
-    if annotated is None or result is None:
-        return annotated
-    boxes = result.boxes
-    if boxes is None or len(boxes) == 0:
-        return annotated
-    xyxy = boxes.xyxy.cpu().numpy()
-    confs = boxes.conf.cpu().numpy()
-    classes = boxes.cls.cpu().numpy().astype(int)
-    names = result.names if hasattr(result, "names") else getattr(model, "names", {})
-    for (x1, y1, x2, y2), conf, cls_id in zip(xyxy, confs, classes):
-        cls_idx = int(cls_id)
-        raw = names.get(cls_idx, str(cls_idx)) if isinstance(names, dict) else (names[cls_idx] if cls_idx < len(names) else str(cls_idx))
-        norm_name = (raw or "").strip().lower().replace(" ", "_")
-        if norm_name not in VIOLATION_CLASSES_FOR_LOG:
-            continue
-        x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
-        label = f"VIOLATION: {norm_name} ({conf:.2f})"
-        color = (0, 0, 255)  # BGR red
-        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 3)
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-        cv2.rectangle(annotated, (x1, y1 - th - 8), (x1 + tw + 4, y1), color, -1)
-        cv2.putText(annotated, label, (x1 + 2, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
-    return annotated
-
-
-def _annotate_frame(frame, result, filter_by_selected=True):
-    """
-    Draw detection boxes on frame. Uses result from DISPLAY queue (full YOLO result with .boxes).
-    When filter_by_selected=True, only draws classes in selected_class_names (from start_live_detection).
-    Uses flexible matching so model names (e.g. vest, safety_shoes) match frontend ids (safety_vest, shoes).
-    """
-    annotated = frame.copy()
-    if result is None:
-        return annotated
-    boxes = result.boxes
-    if boxes is None or len(boxes) == 0:
-        return annotated
-    xyxy = boxes.xyxy.cpu().numpy()
-    confs = boxes.conf.cpu().numpy()
-    classes = boxes.cls.cpu().numpy().astype(int)
-    names = result.names if hasattr(result, "names") else getattr(model, "names", {})
-    for (x1, y1, x2, y2), conf, cls_id in zip(xyxy, confs, classes):
-        if filter_by_selected and selected_class_names:
-            raw = names.get(cls_id, str(cls_id)) if isinstance(names, dict) else (names[cls_id] if cls_id < len(names) else str(cls_id))
-            cls_name = (raw or "").strip()
-            if not _class_matches_selected(cls_name):
-                continue
-        x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
-        label = f"{names.get(cls_id, str(cls_id))} {conf:.2f}" if isinstance(names, dict) else f"{cls_id} {conf:.2f}"
-        cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        cv2.rectangle(annotated, (x1, y1 - th - 4), (x1 + tw, y1), (0, 255, 0), -1)
-        cv2.putText(annotated, label, (x1, y1 - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
-    return annotated
-
-
 @router.websocket("/live_detection_feed_ws")
 async def live_detection_feed_ws(websocket: WebSocket, camera_id: str = "0"):
     """
@@ -1100,10 +1046,9 @@ async def live_detection_feed_ws(websocket: WebSocket, camera_id: str = "0"):
 
 @router.post("/start_live_detection")
 def api_start_live_detection(body: Optional[StartBody] = None):
-    """Start: body.video_path for file; body.camera_id (single) or body.camera_ids for chosen RTSP (omit = all); body.classes to filter by class (omit = all)."""
+    """Start: body.camera_id (single) or body.camera_ids for chosen RTSP (omit = all); body.classes to filter by class (omit = all)."""
     global current_camera_ids
     b = body or StartBody()
-    video_path = b.video_path
     # Create media folders and an empty detections log file immediately
     # so they exist even if the pipeline thread fails later or no detections occur.
     try:
@@ -1121,16 +1066,13 @@ def api_start_live_detection(body: Optional[StartBody] = None):
     # Support both camera_id (single, from frontend) and camera_ids (list); normalize to strings for config lookup
     raw_ids = b.camera_ids if (b.camera_ids and len(b.camera_ids) > 0) else ([b.camera_id] if b.camera_id else None)
     ids = [str(i) for i in raw_ids] if raw_ids else None
-    rtsp_urls = None if video_path else get_rtsp_urls(ids)
-    if video_path:
-        current_camera_ids = ["0"]
-    else:
-        current_camera_ids = list(ids) if ids else sorted(
-            [k for k in CAMERA_CONFIG if CAMERA_CONFIG[k].get("type") == "rtsp" and CAMERA_CONFIG[k].get("url")]
-        )
+    rtsp_urls = get_rtsp_urls(ids)
+    current_camera_ids = list(ids) if ids else sorted(
+        [k for k in CAMERA_CONFIG if CAMERA_CONFIG[k].get("type") == "rtsp" and CAMERA_CONFIG[k].get("url")]
+    )
     def _run_pipeline():
         try:
-            start_pipeline(video_path, rtsp_urls, b.classes)
+            start_pipeline(rtsp_urls, b.classes)
         except Exception as e:
             print(f"[camera_dashboard] Pipeline thread ERROR: {e}")
     threading.Thread(target=_run_pipeline, daemon=True).start()
