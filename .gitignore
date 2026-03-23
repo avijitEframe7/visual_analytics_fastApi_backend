@@ -1,4 +1,15 @@
 .venv/
+logs/*
+__pycache__/*
+app/routes/__pycache__/*
+app/models/__pycache__/*
+app/utils/__pycache__/*
+app/schemas/__pycache__/*
+app/schemas/__pycache__/*
+logs/*
+*.md
+media/
+logs/
+logs.txt
 ML_models/
-.env
-__pycache__/
+testing

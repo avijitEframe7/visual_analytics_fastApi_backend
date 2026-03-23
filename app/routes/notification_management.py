@@ -3,10 +3,23 @@ from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import text
+from typing import Any
 
 from app.database.database import get_db
 
 router = APIRouter(prefix="/api/notification_management", tags=["notification_management"])
+
+
+def _decode_bytes(val: Any) -> str:
+    """Decode DB values (e.g. bytes) to string for JSON; violation/exception type may vary."""
+    if val is None:
+        return ""
+    if isinstance(val, bytes):
+        try:
+            return val.decode("utf-8")
+        except UnicodeDecodeError:
+            return str(val)
+    return str(val)
 
 
 def _time_ago(time_occurred) -> str:
@@ -32,11 +45,11 @@ def _time_ago(time_occurred) -> str:
 
 @router.get("/notifications")
 def get_notifications(db: Session = Depends(get_db)):
-    """Get latest 12 exception log entries with relative time."""
+    """Get latest 12 exception/violation log entries with relative time. Violation type (Exception_Type) can change."""
     try:
         result = db.execute(
             text("""
-                SELECT Exception_Type, time_occurred
+                SELECT Exception_Type, time_occurred, Username
                 FROM employeeinfo.exception_logs
                 ORDER BY time_occurred DESC
                 LIMIT 12
@@ -46,6 +59,10 @@ def get_notifications(db: Session = Depends(get_db)):
         notifications = []
         for row in rows:
             notification = dict(row)
+            if "Exception_Type" in notification:
+                notification["Exception_Type"] = _decode_bytes(notification["Exception_Type"])
+            if "Username" in notification:
+                notification["Username"] = _decode_bytes(notification["Username"]) or None
             if "time_occurred" in notification:
                 notification["time_ago"] = _time_ago(notification["time_occurred"])
             notifications.append(notification)

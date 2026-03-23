@@ -1,9 +1,7 @@
 --extra-index-url https://download.pytorch.org/whl/cu121
-# Optional WebRTC (no Windows wheel for av on Python 3.9; install later if needed):
-# aioice==0.10.2
-# aiortc==1.6.0
-# av==10.0.0
-# pylibsrtp==0.12.0
+ 
+aioice==0.10.2
+aiortc==1.6.0
 annotated-types==0.7.0
 anyio==4.12.1
 certifi==2026.1.4
