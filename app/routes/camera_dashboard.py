@@ -1080,7 +1080,7 @@ async def live_detection_feed_ws(websocket: WebSocket, camera_id: str = "0"):
 
 @router.post(
     "/start_live_detection",
-    dependencies=[Depends(require_permission("camera-dashboard.control"))],
+    dependencies=[Depends(require_permission("camera-dashboard.view"))],
 )
 def api_start_live_detection(body: Optional[StartBody] = None):
     """Start: body.camera_id (single) or body.camera_ids for chosen RTSP (omit = all); body.classes to filter by class (omit = all)."""
@@ -1128,7 +1128,7 @@ def api_start_live_detection(body: Optional[StartBody] = None):
 
 @router.post(
     "/stop_live_detection",
-    dependencies=[Depends(require_permission("camera-dashboard.control"))],
+    dependencies=[Depends(require_permission("camera-dashboard.view"))],
 )
 def api_stop_live_detection():
     """Signal the live detection pipeline to stop; workers will exit and display windows close."""
