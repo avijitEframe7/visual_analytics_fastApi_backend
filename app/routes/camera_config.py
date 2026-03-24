@@ -1,24 +1,51 @@
-CAMERA_CONFIG = {
-    "1": {
-        "name": "Eframe Camera 1",
-        "type": "rtsp",
-        "url": "rtsp://admin:admin@1966@192.168.100.119:554/cam/realmonitor?channel=4&subtype=0",
-        "description": "Eframe Camera 1",
-    },
-    "2": {
-        "name": "Eframe Camera 2",
-        "type": "rtsp",
-        "url": "rtsp://admin:admin@1966@192.168.100.119:554/cam/realmonitor?channel=3&subtype=0",
-        "description": "Eframe Camera 2",
-    },
-}
+from typing import Dict, List, Optional
+
+from sqlalchemy import text
+
+from app.database.database import SessionLocal
 
 
-def get_rtsp_urls(ids=None):
-    """ids=None -> all RTSP (sorted); else URLs for given ids only. Keys normalized to string for lookup."""
-    if ids is None:
-        return [c["url"] for k in sorted(CAMERA_CONFIG) if (c := CAMERA_CONFIG[k]).get("type") == "rtsp" and c.get("url")]
-    return [CAMERA_CONFIG[str(k)]["url"] for k in ids if str(k) in CAMERA_CONFIG and (c := CAMERA_CONFIG[str(k)]).get("type") == "rtsp" and c.get("url")]
+def get_camera_config(ids: Optional[List[str]] = None) -> Dict[str, Dict[str, str]]:
+    """
+    Build camera config from employeeinfo.camera.
+    Keys are camera_id as strings to preserve current caller expectations.
+    """
+    db = SessionLocal()
+    try:
+        query = text(
+            """
+            SELECT camera_id, camera_name, zone_name, ip_address, streaming_url
+            FROM employeeinfo.camera
+            ORDER BY camera_id
+            """
+        )
+        rows = db.execute(query).mappings().all()
+        id_filter = {str(i) for i in ids} if ids is not None else None
+        config: Dict[str, Dict[str, str]] = {}
+        for row in rows:
+            cid = str(row.get("camera_id"))
+            if id_filter is not None and cid not in id_filter:
+                continue
+            config[cid] = {
+                "name": row.get("camera_name") or f"Camera {cid}",
+                "type": "rtsp",
+                "url": row.get("streaming_url"),
+                "description": row.get("zone_name") or "",
+                "ip_address": row.get("ip_address") or "",
+            }
+        return config
+    finally:
+        db.close()
+
+
+def get_rtsp_urls(ids: Optional[List[str]] = None) -> List[str]:
+    """ids=None -> all RTSP URLs from DB (sorted); else URLs for selected ids."""
+    camera_config = get_camera_config(ids=ids)
+    return [
+        cfg["url"]
+        for _, cfg in sorted(camera_config.items(), key=lambda kv: int(kv[0]) if kv[0].isdigit() else kv[0])
+        if cfg.get("type") == "rtsp" and cfg.get("url")
+    ]
 
 
 CAMERA_TYPES = {

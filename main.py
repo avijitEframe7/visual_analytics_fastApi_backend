@@ -19,7 +19,8 @@ from app.routes import (
 
 from app.database.database import Base, engine, SessionLocal
 from app.security.rbac import seed_default_role_page_permissions
-from app.models.admins import Admin  # noqa: F401 (ensure model is registered in metadata)
+from app.models.users import User  # noqa: F401 (ensure model is registered in metadata)
+from app.models.roles import Role  # noqa: F401
 from app.models.role_page_permissions import RolePagePermission  # noqa: F401
 
 # Configure logging

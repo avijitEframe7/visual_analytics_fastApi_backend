@@ -19,7 +19,7 @@ from sqlalchemy import text
 from ultralytics import YOLO
 
 from app.database.database import SessionLocal
-from app.routes.camera_config import CAMERA_CONFIG, get_rtsp_urls
+from app.routes.camera_config import get_camera_config, get_rtsp_urls
 from app.routes.email_feature import enqueue_violation_email
 from app.security.rbac import decode_access_token, get_role_allowed_page_keys, require_permission
 
@@ -41,7 +41,7 @@ for _p in _trt_paths:
 # -----------------------------------------------------------------------------
 # Config: streams, inference tuning, reconnect
 # -----------------------------------------------------------------------------
-RTSP_URLS = get_rtsp_urls()
+RTSP_URLS: List[str] = []
 
 # FPS / throughput: skip every Nth frame; resize before inference
 FRAME_SKIP = 1
@@ -629,10 +629,18 @@ def _exception_log_worker():
             db.execute(
                 text("""
                     INSERT INTO employeeinfo.exception_logs
-                    (time_occurred, Username, Employee_id, Exception_Type, Incident_image)
-                    VALUES (:t, :u, :e, :x, :i)
+                    (time_occurred, exception_type_id, Incident_image, updated_at)
+                    VALUES (
+                        :t,
+                        (SELECT et.exception_type_id
+                         FROM employeeinfo.Exception_Type et
+                         WHERE et.exception_name = :x
+                         LIMIT 1),
+                        :i,
+                        NOW()
+                    )
                 """),
-                {"t": time_occurred, "u": "Unknown", "e": "Unknown", "x": exception_type, "i": image_path},
+                {"t": time_occurred, "x": exception_type, "i": image_path},
             )
             db.commit()
             print(f"[camera_dashboard] exception_log: DB insert OK for {exception_type}")
@@ -776,8 +784,9 @@ router = APIRouter(
 
 @router.get("/cameras")
 def get_cameras():
-    """Get list of all available cameras from CAMERA_CONFIG."""
+    """Get list of all available cameras from employeeinfo.camera."""
     try:
+        camera_config = get_camera_config()
         cameras = {
             cid: {
                 "name": cfg.get("name", f"Camera {cid}"),
@@ -785,7 +794,7 @@ def get_cameras():
                 "url": cfg.get("url"),
                 "description": cfg.get("description", ""),
             }
-            for cid, cfg in CAMERA_CONFIG.items()
+            for cid, cfg in camera_config.items()
         }
         return {"cameras": cameras, "total_cameras": len(cameras)}
     except Exception as e:
@@ -799,6 +808,58 @@ class StartBody(BaseModel):
     camera_id: Optional[str] = None  # single camera (frontend sends this)
     camera_ids: Optional[List[str]] = None  # omit = all RTSP
     classes: Optional[List[str]] = None  # omit or empty = show all; else only these class names (e.g. helmet, shoes)
+
+
+def _mark_streams_started(camera_ids: List[str]):
+    """Insert running rows into employeeinfo.camera_streams for current live session."""
+    db = SessionLocal()
+    try:
+        for cam_id in camera_ids:
+            if not str(cam_id).isdigit():
+                continue
+            stream_url = f"/api/camera_dashboard/live_detection_feed?camera_id={cam_id}"
+            db.execute(
+                text(
+                    """
+                    INSERT INTO employeeinfo.camera_streams (camera_id, video_feed_url, status, started_at)
+                    VALUES (:camera_id, :video_feed_url, 'running', NOW())
+                    """
+                ),
+                {"camera_id": int(cam_id), "video_feed_url": stream_url},
+            )
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[camera_dashboard] camera_streams start insert failed: {e}")
+    finally:
+        db.close()
+
+
+def _mark_streams_stopped(camera_ids: List[str]):
+    """Mark latest running rows as stopped for active camera_ids."""
+    if not camera_ids:
+        return
+    db = SessionLocal()
+    try:
+        for cam_id in camera_ids:
+            if not str(cam_id).isdigit():
+                continue
+            db.execute(
+                text(
+                    """
+                    UPDATE employeeinfo.camera_streams
+                    SET status = 'stopped', stopped_at = NOW()
+                    WHERE camera_id = :camera_id AND status = 'running'
+                    """
+                ),
+                {"camera_id": int(cam_id)},
+            )
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[camera_dashboard] camera_streams stop update failed: {e}")
+    finally:
+        db.close()
 
 
 def _camera_index(camera_id: str) -> int:
@@ -1100,12 +1161,13 @@ def api_start_live_detection(body: Optional[StartBody] = None):
         )
     except Exception as e:
         print(f"[camera_dashboard] ERROR creating media dirs or log file: {e}")
+    camera_config = get_camera_config()
     # Support both camera_id (single, from frontend) and camera_ids (list); normalize to strings for config lookup
     raw_ids = b.camera_ids if (b.camera_ids and len(b.camera_ids) > 0) else ([b.camera_id] if b.camera_id else None)
     ids = [str(i) for i in raw_ids] if raw_ids else None
     rtsp_urls = get_rtsp_urls(ids)
     current_camera_ids = list(ids) if ids else sorted(
-        [k for k in CAMERA_CONFIG if CAMERA_CONFIG[k].get("type") == "rtsp" and CAMERA_CONFIG[k].get("url")]
+        [k for k, cfg in camera_config.items() if cfg.get("type") == "rtsp" and cfg.get("url")]
     )
     def _run_pipeline():
         try:
@@ -1117,12 +1179,13 @@ def api_start_live_detection(body: Optional[StartBody] = None):
     feed_camera_id = current_camera_ids[0] if current_camera_ids else "0"
     feed_url = f"/api/camera_dashboard/live_detection_feed?camera_id={feed_camera_id}"
     feed_ws_url = f"/api/camera_dashboard/live_detection_feed_ws?camera_id={feed_camera_id}"
+    _mark_streams_started(current_camera_ids)
     return {
         "status": "success",
         "feed_url": feed_url,
         "feed_ws_url": feed_ws_url,
         "camera_ids": current_camera_ids,
-        "camera_name": CAMERA_CONFIG.get(feed_camera_id, {}).get("name", f"Camera {feed_camera_id}"),
+        "camera_name": camera_config.get(feed_camera_id, {}).get("name", f"Camera {feed_camera_id}"),
     }
 
 
@@ -1133,5 +1196,6 @@ def api_start_live_detection(body: Optional[StartBody] = None):
 def api_stop_live_detection():
     """Signal the live detection pipeline to stop; workers will exit and display windows close."""
     pipeline_stop_event.set()
+    _mark_streams_stopped(current_camera_ids)
     return {"status": "success"}
 

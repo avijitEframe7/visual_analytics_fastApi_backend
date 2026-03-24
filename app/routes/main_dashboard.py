@@ -193,20 +193,25 @@ def get_exception_piechart(
     time_range: str = Query("all"),
     db: Session = Depends(get_db)
 ):
-    query = "SELECT Exception_Type, COUNT(*) FROM exception_logs"
+    query = """
+        SELECT et.exception_name, COUNT(*)
+        FROM employeeinfo.exception_logs el
+        JOIN employeeinfo.Exception_Type et
+          ON et.exception_type_id = el.exception_type_id
+    """
 
     if time_range == "day":
-        query += " WHERE time_occurred >= NOW() - INTERVAL 1 DAY"
+        query += " WHERE el.time_occurred >= NOW() - INTERVAL 1 DAY"
     elif time_range == "week":
-        query += " WHERE time_occurred >= NOW() - INTERVAL 7 DAY"
+        query += " WHERE el.time_occurred >= NOW() - INTERVAL 7 DAY"
     elif time_range == "month":
-        query += " WHERE time_occurred >= NOW() - INTERVAL 1 MONTH"
+        query += " WHERE el.time_occurred >= NOW() - INTERVAL 1 MONTH"
     elif time_range == "quarter":
-        query += " WHERE time_occurred >= NOW() - INTERVAL 3 MONTH"
+        query += " WHERE el.time_occurred >= NOW() - INTERVAL 3 MONTH"
     elif time_range == "year":
-        query += " WHERE time_occurred >= NOW() - INTERVAL 1 YEAR"
+        query += " WHERE el.time_occurred >= NOW() - INTERVAL 1 YEAR"
 
-    query += " GROUP BY Exception_Type"
+    query += " GROUP BY et.exception_name"
 
     result = db.execute(text(query)).fetchall()
 
@@ -217,10 +222,16 @@ def get_exception_piechart(
 
 @router.get("/bargraph-user-exception-counts")
 def get_user_exception_counts(db: Session = Depends(get_db)):
+    """
+    Kept route path for frontend compatibility.
+    New exception_logs schema uses exception_type_id; resolve labels from Exception_Type table.
+    """
     result = db.execute(text("""
-        SELECT Username, COUNT(*) 
-        FROM exception_logs
-        GROUP BY Username
+        SELECT et.exception_name, COUNT(*)
+        FROM employeeinfo.exception_logs el
+        JOIN employeeinfo.Exception_Type et
+          ON et.exception_type_id = el.exception_type_id
+        GROUP BY et.exception_name
     """)).fetchall()
 
     return {
@@ -231,8 +242,8 @@ def get_user_exception_counts(db: Session = Depends(get_db)):
 @router.get("/exception-heatmap")
 def exception_heatmap(db: Session = Depends(get_db)):
     rows = db.execute(text("""
-        SELECT time_occurred, Exception_Type
-        FROM exception_logs
+        SELECT time_occurred
+        FROM employeeinfo.exception_logs
     """)).fetchall()
 
     timestamps = [safe_datetime_str(r[0]) for r in rows]
@@ -251,8 +262,8 @@ def exception_heatmap(db: Session = Depends(get_db)):
 @router.get("/exception-heatmap")
 def exception_heatmap(db: Session = Depends(get_db)):
     rows = db.execute(text("""
-        SELECT time_occurred, Exception_Type
-        FROM exception_logs
+        SELECT time_occurred
+        FROM employeeinfo.exception_logs
     """)).fetchall()
 
     timestamps = [safe_datetime_str(r[0]) for r in rows]
