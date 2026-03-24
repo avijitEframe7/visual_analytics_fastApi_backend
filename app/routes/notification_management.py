@@ -50,12 +50,19 @@ def _time_ago(time_occurred) -> str:
 
 @router.get("/notifications")
 def get_notifications(db: Session = Depends(get_db)):
-    """Get latest 12 exception/violation log entries with relative time. Violation type (Exception_Type) can change."""
+    """Get latest 12 exception/violation log entries with relative time."""
     try:
         result = db.execute(
             text("""
-                SELECT Exception_Type, time_occurred, Username
-                FROM employeeinfo.exception_logs
+                SELECT
+                    el.log_id,
+                    et.exception_name AS Exception_Type,
+                    el.Incident_image,
+                    el.time_occurred,
+                    el.updated_at
+                FROM employeeinfo.exception_logs el
+                JOIN employeeinfo.Exception_Type et
+                  ON et.exception_type_id = el.exception_type_id
                 ORDER BY time_occurred DESC
                 LIMIT 12
             """)
@@ -66,8 +73,6 @@ def get_notifications(db: Session = Depends(get_db)):
             notification = dict(row)
             if "Exception_Type" in notification:
                 notification["Exception_Type"] = _decode_bytes(notification["Exception_Type"])
-            if "Username" in notification:
-                notification["Username"] = _decode_bytes(notification["Username"]) or None
             if "time_occurred" in notification:
                 notification["time_ago"] = _time_ago(notification["time_occurred"])
             notifications.append(notification)

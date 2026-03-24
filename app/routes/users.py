@@ -9,12 +9,12 @@ router = APIRouter(dependencies=[Depends(require_role("admin"))])
 @router.get("/get_users")
 # def get_users(db = Depends(get_db)):
 #     cursor = db.cursor(dictionary=True)
-#     cursor.execute("SELECT * FROM admins")
+#     cursor.execute("SELECT * FROM users")
 #     result = cursor.fetchall()
 #     cursor.close()
 #     return result
 def get_users(db: Session = Depends(get_db)):
-    result = db.execute(text("SELECT * FROM admins"))
+    result = db.execute(text("SELECT * FROM employeeinfo.users"))
     rows = result.mappings().all()  # list of dicts
     return rows
 
