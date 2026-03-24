@@ -10,7 +10,8 @@ from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.database.database import get_db
-from app.models.admins import Admin
+from app.models.users import User
+from app.models.roles import Role
 from app.models.role_page_permissions import RolePagePermission
 
 
@@ -168,6 +169,21 @@ def _normalize_role(role: Optional[str]) -> str:
     return r
 
 
+def resolve_role_for_role_id(db: Session, role_id: Optional[int]) -> str:
+    """
+    Map users.role_id to canonical RBAC role string via the `roles` table.
+    If the row is missing, treat role_id 1 as admin (common convention); otherwise user.
+    """
+    if role_id is None:
+        return "user"
+    role = db.query(Role).filter(Role.role_id == role_id).first()
+    if role and (role.role_name or "").strip():
+        return _normalize_role(role.role_name)
+    if role_id == 1:
+        return "admin"
+    return "user"
+
+
 def create_access_token(payload: Dict[str, Any]) -> str:
     if JWT_ALGORITHM != "HS256":
         raise HTTPException(
@@ -227,11 +243,11 @@ def get_current_admin_payload(request: Request, db: Session) -> Dict[str, Any]:
             detail="Invalid token payload",
         )
 
-    # Prefer role from token. If missing, fetch from DB.
+    # Prefer role from token. If missing, resolve from users.role_id via roles table.
     role = decoded.get("role")
     if not role:
-        admin = db.query(Admin).filter(Admin.AdminId == admin_id).first()
-        role = admin.Role if admin else None
+        user = db.query(User).filter(User.user_id == admin_id).first()
+        role = resolve_role_for_role_id(db, user.role_id) if user else None
 
     return {
         "adminId": int(admin_id),

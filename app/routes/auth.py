@@ -3,7 +3,7 @@ from typing import Dict, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 from app.database.database import get_db
-from app.models.admins import Admin
+from app.models.users import User
 from app.models.role_page_permissions import RolePagePermission
 from app.schemas.auth import LoginRequest
 from app.security.rbac import (
@@ -12,6 +12,7 @@ from app.security.rbac import (
     get_role_allowed_page_keys,
     require_authenticated,
     require_role,
+    resolve_role_for_role_id,
 )
 from pydantic import BaseModel
 import hashlib
@@ -23,33 +24,33 @@ router = APIRouter(prefix="/api", tags=["Auth"])
 
 @router.post("/auth/login")
 def login(data: LoginRequest, db: Session = Depends(get_db)):
-    admin = (
-        db.query(Admin)
+    user = (
+        db.query(User)
         .filter(
-            Admin.AdminId == data.adminId,
-            Admin.Username == data.username
+            User.user_id == data.adminId,
+            User.username == data.username,
         )
         .first()
     )
 
-    if not admin:
+    if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid id or username"
         )
     hashed_password = sha256_hash(data.password)
     # Plain-text comparison shown for learning
-    if admin.Password != hashed_password:
+    if user.password != hashed_password:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid password"
         )
 
-    role = (admin.Role or "").strip().lower()
+    role = resolve_role_for_role_id(db, user.role_id)
     token = create_access_token(
         {
-            "sub": admin.AdminId,
-            "username": admin.Username,
+            "sub": user.user_id,
+            "username": user.username,
             "role": role,
         }
     )
@@ -58,8 +59,8 @@ def login(data: LoginRequest, db: Session = Depends(get_db)):
         "success": True,
         "message": "Login successful!!!",
         "user": {
-            "adminId": admin.AdminId,
-            "username": admin.Username,
+            "adminId": user.user_id,
+            "username": user.username,
             "role": role,
         },
         "token": token,

@@ -5,10 +5,10 @@ from app.database.database import Base
 
 class RolePagePermission(Base):
     """
-    RBAC page permissions configured by admins.
+    RBAC page permissions configured by administrators.
 
     We store permissions per role (not per individual user) because your roles are already
-    defined via the `admins.Role` column.
+    defined via `users.role_id` joined to `roles.role_name`.
     """
 
     __tablename__ = "role_page_permissions"
