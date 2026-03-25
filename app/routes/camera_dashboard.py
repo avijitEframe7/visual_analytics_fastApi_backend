@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 import queue
 import re
@@ -21,7 +22,11 @@ from ultralytics import YOLO
 from app.database.database import SessionLocal
 from app.routes.camera_config import get_camera_config, get_rtsp_urls
 from app.routes.email_feature import enqueue_violation_email
-from app.security.rbac import decode_access_token, get_role_allowed_page_keys, require_permission
+from app.security.rbac import (
+    decode_access_token,
+    get_user_allowed_page_keys,
+    require_permission,
+)
 
 # Add TensorRT DLL search paths before any TensorRT/Ultralytics use (fixes nvinfer_10.dll not found)
 _script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -86,7 +91,15 @@ USER_SELECTION_TO_VIOLATION: dict = {
 }
 
 # Exception log: violations to insert into dbo.exception_logs (notification feed)
-VIOLATION_CLASSES_FOR_LOG = frozenset({"no_helmet", "no_vest", "no_goggles", "no_safetyshoes"})
+# Model training names (normalized) vs dbo.exception_type.exception_name — map below when they differ.
+VIOLATION_CLASSES_FOR_LOG = frozenset(
+    {"no_helmet", "no_vest", "no_goggles", "no_safetyshoes", "no_gloves"}
+)
+# YOLO emits short names; employeeinfo.exception_type uses longer labels (see SSMS seed rows).
+MODEL_NORMALIZED_TO_DB_EXCEPTION_NAME: dict[str, str] = {
+    "no_vest": "no_safety_vest",
+    "no_safetyshoes": "no_safety_shoes",
+}
 EXCEPTION_LOG_THROTTLE_SECONDS = 180
 EXCEPTION_LOG_QUEUE_SIZE = 32
 exception_log_queue: queue.Queue = queue.Queue(maxsize=EXCEPTION_LOG_QUEUE_SIZE)
@@ -109,6 +122,85 @@ MEDIA_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(os.pat
 EXCEPTION_LOGS_DIR = os.path.abspath(os.path.join(MEDIA_ROOT, "exception_logs"))
 DETECTION_FRAMES_DIR = os.path.abspath(os.path.join(MEDIA_ROOT, "detection_frames"))
 DETECTION_LOG_FILE = os.path.abspath(os.path.join(MEDIA_ROOT, "logs.txt"))
+EXCEPTION_PIPELINE_LOG_PATH = os.path.abspath(os.path.join(MEDIA_ROOT, "exception_pipeline.log"))
+
+_exception_pipeline_logger: Optional[logging.Logger] = None
+
+
+def _log_exception_pipeline(msg: str) -> None:
+    """Print to stdout and append to media/exception_pipeline.log (survives headless / service runs)."""
+    global _exception_pipeline_logger
+    print(f"[camera_dashboard] {msg}")
+    try:
+        os.makedirs(MEDIA_ROOT, exist_ok=True)
+        if _exception_pipeline_logger is None:
+            lg = logging.getLogger("camera_dashboard.exception_pipeline")
+            lg.setLevel(logging.INFO)
+            lg.handlers.clear()
+            fh = logging.FileHandler(EXCEPTION_PIPELINE_LOG_PATH, encoding="utf-8")
+            fh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+            lg.addHandler(fh)
+            lg.propagate = False
+            _exception_pipeline_logger = lg
+        _exception_pipeline_logger.info(msg)
+    except Exception as e:
+        print(f"[camera_dashboard] exception_log: failed to write exception_pipeline.log: {e}")
+
+
+def _raw_class_name_from_names(names: Any, cls_idx: int) -> str:
+    """Ultralytics may expose class names as dict (id -> str) or list; avoid .get on lists."""
+    ci = int(cls_idx)
+    if isinstance(names, dict):
+        return str(names.get(ci, str(ci)))
+    try:
+        if 0 <= ci < len(names):
+            return str(names[ci])
+    except (TypeError, IndexError, KeyError):
+        pass
+    return str(ci)
+
+
+def _normalize_exception_name_for_db(s: str) -> str:
+    """Match model output (e.g. no_helmet) to dbo.exception_type.exception_name (may be NO_helmet, 'No Helmet', etc.)."""
+    x = (s or "").strip().lower().replace(" ", "_").replace("-", "_")
+    while "__" in x:
+        x = x.replace("__", "_")
+    return x.strip("_")
+
+
+def _resolve_exception_type_id(db, exception_type: str) -> Optional[int]:
+    """
+    Resolve FK for dbo.exception_logs. Exact equality on exception_name often fails when the DB
+    uses different casing or spacing than the normalized YOLO class name.
+    Also maps model names to dbo.exception_type rows (e.g. no_vest -> no_safety_vest).
+    """
+    norm = _normalize_exception_name_for_db(exception_type)
+    db_label = MODEL_NORMALIZED_TO_DB_EXCEPTION_NAME.get(norm, norm)
+    sql_norm = _normalize_exception_name_for_db(db_label)
+    row = db.execute(
+        text(
+            """
+            SELECT TOP 1 et.exception_type_id
+            FROM dbo.exception_type et
+            WHERE LOWER(REPLACE(REPLACE(LTRIM(RTRIM(et.exception_name)), ' ', '_'), '-', '_')) = :norm
+            """
+        ),
+        {"norm": sql_norm},
+    ).scalar()
+    if row is not None:
+        return int(row)
+    rows = db.execute(
+        text(
+            "SELECT exception_type_id, exception_name FROM dbo.exception_type ORDER BY exception_type_id"
+        )
+    ).fetchall()
+    _log_exception_pipeline(
+        f"exception_log: no exception_type_id for model class {exception_type!r} "
+        f"(normalized={norm!r}, db_lookup={sql_norm!r}). Check dbo.exception_type.exception_name. "
+        f"Current rows: {rows}"
+    )
+    return None
+
 
 # Counters for debugging (YOLO worker)
 _debug_frames_with_detections = 0
@@ -120,6 +212,24 @@ pipeline_stop_event = threading.Event()
 
 # Ordered camera ids for current pipeline (index = display queue index)
 current_camera_ids: List[str] = []
+
+
+def _pipeline_index_to_db_camera_id(cam_index) -> int:
+    """
+    RTSP/YOLO threads tag frames with a stream index (0..n-1). dbo.camera uses the real PK
+    (see current_camera_ids from start_live_detection). Storing the index as camera_id breaks
+    JOINs to dbo.camera; map index -> actual camera_id for exception_logs and email.
+    """
+    global current_camera_ids
+    try:
+        idx = int(cam_index)
+    except (TypeError, ValueError):
+        idx = 0
+    if 0 <= idx < len(current_camera_ids):
+        raw = str(current_camera_ids[idx]).strip()
+        if raw.isdigit():
+            return int(raw)
+    return idx
 
 
 def _ensure_detection_log_file():
@@ -499,7 +609,8 @@ def yolo_batch_worker():
                             cls_np = boxes.cls.cpu().numpy()
                             seen_violations = set()
                             for c in cls_np:
-                                name = (names.get(int(c), str(c)) or "").strip().lower().replace(" ", "_")
+                                raw = _raw_class_name_from_names(names, int(c))
+                                name = _normalize_exception_name_for_db(raw)
                                 if name in VIOLATION_CLASSES_FOR_LOG:
                                     seen_violations.add(name)
                             if seen_violations:
@@ -516,7 +627,10 @@ def yolo_batch_worker():
                                                 annotated_frame = _annotate_frame_for_exception(frame_copy.copy(), res, v)
                                                 exception_log_queue.put_nowait((cam_id, annotated_frame, v, time_occurred))
                                             except queue.Full:
-                                                pass
+                                                _log_exception_pipeline(
+                                                    f"exception_log: queue full ({EXCEPTION_LOG_QUEUE_SIZE}), "
+                                                    f"dropping {v} cam={cam_id}"
+                                                )
                     
                     # Update performance stats and debug counters
                     inference_time = time.time() - start_time
@@ -599,9 +713,9 @@ def _exception_log_worker():
     """Background thread: consume exception_log_queue, save annotated frame (with violation boxes) to disk, INSERT into dbo.exception_logs."""
     try:
         os.makedirs(EXCEPTION_LOGS_DIR, exist_ok=True)
-        print(f"[camera_dashboard] Exception-log worker started; saving to: {EXCEPTION_LOGS_DIR}")
+        _log_exception_pipeline(f"exception_log: Exception-log worker started; saving to: {EXCEPTION_LOGS_DIR}")
     except Exception as e:
-        print(f"[camera_dashboard] exception_log: ERROR creating dir {EXCEPTION_LOGS_DIR}: {e}")
+        _log_exception_pipeline(f"exception_log: ERROR creating dir {EXCEPTION_LOGS_DIR}: {e}")
         return
     while True:
         if pipeline_stop_event.is_set():
@@ -610,54 +724,68 @@ def _exception_log_worker():
             item = exception_log_queue.get(timeout=1.0)
         except queue.Empty:
             continue
-        # (cam_id, annotated_frame, exception_type, time_occurred) - frame is already drawn in inference loop
+        # (cam_id, annotated_frame, exception_type, time_occurred) - cam_id is pipeline stream index
         cam_id, frame, exception_type, time_occurred = item[0], item[1], item[2], item[3]
         if frame is None or not exception_type:
             continue
+        db_camera_id = _pipeline_index_to_db_camera_id(cam_id)
         safe_type = re.sub(r"[^\w\-]", "_", exception_type)[:32]
         safe_ts = re.sub(r"[^\d\-]", "_", time_occurred)[:20]
-        filename = f"exception_{safe_ts}_{cam_id}_{safe_type}.jpg"
+        filename = f"exception_{safe_ts}_{db_camera_id}_{safe_type}.jpg"
         image_path = os.path.join(EXCEPTION_LOGS_DIR, filename)
         try:
             cv2.imwrite(image_path, frame)
-            print(f"[camera_dashboard] exception_log: saved image {filename} (with violation boxes)")
+            _log_exception_pipeline(f"exception_log: saved image {filename} (with violation boxes)")
         except Exception as e:
-            print(f"[camera_dashboard] exception_log: failed to save image: {e}")
+            _log_exception_pipeline(f"exception_log: failed to save image: {e}")
+            continue
+        # dbo.exception_logs.Incident_image is varbinary(max): store JPEG bytes, not the path string.
+        try:
+            with open(image_path, "rb") as _imgf:
+                image_blob = _imgf.read()
+        except OSError as e:
+            _log_exception_pipeline(f"exception_log: failed to read image for DB: {e}")
+            continue
+        if not image_blob:
+            _log_exception_pipeline("exception_log: empty image file, skip DB insert")
             continue
         db = SessionLocal()
         try:
+            et_id = _resolve_exception_type_id(db, exception_type)
+            if et_id is None:
+                continue
+            try:
+                t_occ = datetime.strptime(time_occurred, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                t_occ = datetime.now()
             db.execute(
-                text("""
+                text(
+                    """
                     INSERT INTO dbo.exception_logs
-                    (time_occurred, exception_type_id, Incident_image, updated_at)
-                    VALUES (
-                        :t,
-                        (SELECT et.exception_type_id
-                         FROM dbo.exception_type et
-                         WHERE et.exception_name = :x
-                         ORDER BY et.exception_type_id
-                         OFFSET 0 ROWS FETCH NEXT 1 ROWS ONLY),
-                        :i,
-                        GETDATE()
-                    )
-                """),
-                {"t": time_occurred, "x": exception_type, "i": image_path},
+                    (time_occurred, exception_type_id, Incident_image, updated_at, camera_id)
+                    VALUES (:t, :eid, :i, GETDATE(), :cid)
+                    """
+                ),
+                {"t": t_occ, "eid": et_id, "i": image_blob, "cid": db_camera_id},
             )
             db.commit()
-            print(f"[camera_dashboard] exception_log: DB insert OK for {exception_type}")
+            _log_exception_pipeline(
+                f"exception_log: DB insert OK for {exception_type} (exception_type_id={et_id}) "
+                f"camera_id={db_camera_id}"
+            )
             # Enqueue an email notification; this is non-blocking (just adds to a queue).
             try:
                 enqueue_violation_email(
-                    camera_id=int(cam_id),
+                    camera_id=db_camera_id,
                     exception_type=exception_type,
                     image_path=image_path,
                     time_occurred=time_occurred,
                 )
             except Exception as e:
                 # Do not break logging if email enqueue fails.
-                print(f"[camera_dashboard] exception_log: failed to enqueue email: {e}")
+                _log_exception_pipeline(f"exception_log: failed to enqueue email: {e}")
         except Exception as e:
-            print(f"[camera_dashboard] exception_log: DB insert failed: {e}")
+            _log_exception_pipeline(f"exception_log: DB insert failed: {e}")
             db.rollback()
         finally:
             db.close()
@@ -893,6 +1021,7 @@ def debug_storage():
     """
     Debug endpoint: storage paths, whether dirs exist, pipeline state, queue sizes, and sample files.
     Use this to see exactly where the code is broken.
+    Exception DB pipeline messages are also written to media/exception_pipeline.log; tail is included here.
     """
     def list_dir_safe(path: str, max_files: int = 20) -> List[str]:
         try:
@@ -900,6 +1029,16 @@ def debug_storage():
                 return []
             names = sorted(os.listdir(path))[:max_files]
             return names
+        except Exception:
+            return []
+
+    def tail_file(path: str, max_lines: int = 40) -> List[str]:
+        try:
+            if not os.path.isfile(path):
+                return []
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+            return [ln.rstrip("\n\r") for ln in lines[-max_lines:]]
         except Exception:
             return []
 
@@ -921,6 +1060,9 @@ def debug_storage():
         "debug_frames_with_detections": frames_with_det,
         "exception_logs_sample_files": list_dir_safe(EXCEPTION_LOGS_DIR),
         "detection_frames_sample_files": list_dir_safe(DETECTION_FRAMES_DIR),
+        "exception_pipeline_log_path": EXCEPTION_PIPELINE_LOG_PATH,
+        "exception_pipeline_log_exists": os.path.isfile(EXCEPTION_PIPELINE_LOG_PATH),
+        "exception_pipeline_log_tail": tail_file(EXCEPTION_PIPELINE_LOG_PATH, 40),
     }
 
 
@@ -994,13 +1136,11 @@ async def live_detection_feed_ws(websocket: WebSocket, camera_id: str = "0"):
     - If client sends {"mode": "webrtc"}, perform WebRTC signaling (offer/answer) and stream via WebRTC (requires aiortc).
     - Otherwise stream JPEG frames as binary for low-latency canvas rendering.
     """
-    # Auth for WebSocket clients: since browsers can't set Authorization headers reliably,
-    # we accept `?token=...` (preferred) and validate it before streaming.
-    raw_token = websocket.query_params.get("token")
-    if not raw_token:
-        auth = websocket.headers.get("authorization")
-        if auth and auth.lower().startswith("bearer "):
-            raw_token = auth.split(" ", 1)[1].strip()
+    # WebSocket auth: Authorization header only.
+    auth = websocket.headers.get("authorization")
+    raw_token = None
+    if auth and auth.lower().startswith("bearer "):
+        raw_token = auth.split(" ", 1)[1].strip()
 
     if not raw_token:
         await websocket.close(code=4401)
@@ -1009,17 +1149,18 @@ async def live_detection_feed_ws(websocket: WebSocket, camera_id: str = "0"):
     try:
         decoded = decode_access_token(raw_token)
         role = (decoded.get("role") or "").strip().lower()
+        user_id = int(decoded.get("sub"))
     except Exception:
         await websocket.close(code=4401)
         return
 
     db = SessionLocal()
     try:
-        allowed_keys = get_role_allowed_page_keys(db=db, role=role)
+        allowed_keys = get_user_allowed_page_keys(db=db, user_id=user_id, role=role)
     finally:
         db.close()
 
-    if "camera-dashboard.view" not in allowed_keys and role != "admin":
+    if "camera-dashboard.view" not in allowed_keys:
         await websocket.close(code=4403)
         return
 

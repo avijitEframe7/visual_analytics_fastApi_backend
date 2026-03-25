@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from app.database.database import get_db
 from app.models.users import User
 from app.models.roles import Role
-from app.models.role_page_permissions import RolePagePermission
+from app.models.user_page_permissions import UserPagePermission
 
 
 # -----------------------------
@@ -131,12 +131,12 @@ KNOWN_PAGE_KEYS: List[str] = [
 
 
 # -----------------------------
-# Default permission seeding
+# Default per-user permission seeding (in-code only; DB table is user_page_permissions)
 # -----------------------------
 DEFAULT_ROLE_PAGE_ALLOWED: Dict[str, List[str]] = {
     # Admin can see everything by default.
     "admin": KNOWN_PAGE_KEYS,
-    # "user" is limited by default; admin can override via RBAC UI/API.
+    # "user" is limited by default; admin can override per user via UI/API.
     "user": [
         "dashboard.view",
         "camera-dashboard.view",
@@ -263,16 +263,22 @@ def require_authenticated(request: Request, db: Session = Depends(get_db)) -> Di
     return get_current_admin_payload(request=request, db=db)
 
 
-def get_role_allowed_page_keys(db: Session, role: str) -> List[str]:
+def get_user_allowed_page_keys(db: Session, user_id: int, role: str) -> List[str]:
+    """
+    Final source of truth for sidebar/page visibility.
+
+    - Admin bypass: always allowed for every known page key.
+    - Non-admin: allowed keys are stored per-user in `user_page_permissions`.
+    """
     role_n = _normalize_role(role)
     if role_n == "admin":
         return list(KNOWN_PAGE_KEYS)
 
     rows = (
-        db.query(RolePagePermission)
+        db.query(UserPagePermission)
         .filter(
-            RolePagePermission.role == role_n,
-            RolePagePermission.allowed.is_(True),
+            UserPagePermission.user_id == user_id,
+            UserPagePermission.allowed == True,
         )
         .all()
     )
@@ -282,7 +288,7 @@ def get_role_allowed_page_keys(db: Session, role: str) -> List[str]:
 def require_permission(page_key: str):
     """
     Dependency factory for FastAPI endpoints.
-    Uses JWT payload to identify role, then checks `role_page_permissions`.
+    Checks the user's per-page permissions from `user_page_permissions`.
     """
 
     if page_key not in KNOWN_PAGE_KEYS:
@@ -291,7 +297,9 @@ def require_permission(page_key: str):
 
     def dependency(request: Request, db: Session = Depends(get_db)) -> Dict[str, Any]:
         admin = get_current_admin_payload(request=request, db=db)
-        allowed_keys = get_role_allowed_page_keys(db=db, role=admin["role"])
+        allowed_keys = get_user_allowed_page_keys(
+            db=db, user_id=admin["adminId"], role=admin["role"]
+        )
         if page_key not in allowed_keys:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -317,19 +325,26 @@ def require_role(required_role: str):
     return dependency
 
 
-def seed_default_role_page_permissions(db: Session) -> None:
+def seed_default_user_page_permissions(db: Session) -> None:
     """
-    Ensure every known page has a row for each known role.
-    We only insert missing rows (do not overwrite existing admin choices).
+    Seed per-user permissions in `user_page_permissions` based on the user's role.
+    We only insert missing rows so admin overrides persist.
     """
-    for role, allowed_pages in DEFAULT_ROLE_PAGE_ALLOWED.items():
-        role_n = _normalize_role(role)
+    users = db.query(User).all()
+    for user in users:
+        role_n = resolve_role_for_role_id(db, user.role_id)
+
+        if role_n == "admin":
+            allowed_pages = set(KNOWN_PAGE_KEYS)
+        else:
+            allowed_pages = set(DEFAULT_ROLE_PAGE_ALLOWED.get(role_n, []))
+
         for page_key in KNOWN_PAGE_KEYS:
             existing = (
-                db.query(RolePagePermission)
+                db.query(UserPagePermission)
                 .filter(
-                    RolePagePermission.role == role_n,
-                    RolePagePermission.page_key == page_key,
+                    UserPagePermission.user_id == user.user_id,
+                    UserPagePermission.page_key == page_key,
                 )
                 .first()
             )
@@ -337,8 +352,8 @@ def seed_default_role_page_permissions(db: Session) -> None:
                 continue
 
             db.add(
-                RolePagePermission(
-                    role=role_n,
+                UserPagePermission(
+                    user_id=user.user_id,
                     page_key=page_key,
                     allowed=(page_key in allowed_pages),
                 )

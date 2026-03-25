@@ -18,10 +18,10 @@ from app.routes import (
 )
 
 from app.database.database import Base, engine, SessionLocal
-from app.security.rbac import seed_default_role_page_permissions
+from app.security.rbac import seed_default_user_page_permissions
 from app.models.users import User  # noqa: F401 (ensure model is registered in metadata)
 from app.models.roles import Role  # noqa: F401
-from app.models.role_page_permissions import RolePagePermission  # noqa: F401
+from app.models.user_page_permissions import UserPagePermission  # noqa: F401
 
 # Configure logging
 log_dir = Path("logs")
@@ -59,13 +59,13 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup_event():
     logger.info("Starting Visual Analytics API...")
-    # Ensure RBAC tables exist (dev-friendly) and seed default role permissions.
+    # Ensure RBAC tables exist (dev-friendly) and seed default per-user page permissions.
     # In production, prefer migrations instead of auto-creating tables.
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
     try:
-        seed_default_role_page_permissions(db)
-        logger.info("RBAC role/page permissions seeded")
+        seed_default_user_page_permissions(db)
+        logger.info("RBAC user page permissions seeded")
     finally:
         db.close()
     logger.info("Application startup complete")
