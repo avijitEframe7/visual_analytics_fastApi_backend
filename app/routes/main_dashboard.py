@@ -45,24 +45,24 @@ def fetch_logs_by_trend_analysis(
     if time_range == "weekly":
         query = text("""
             SELECT 
-                DAYNAME(time_occurred) AS label,
-                DATE(time_occurred) AS date_val,
+                DATENAME(WEEKDAY, time_occurred) AS label,
+                CAST(time_occurred AS DATE) AS date_val,
                 COUNT(*) AS count
-            FROM exception_logs
-            WHERE time_occurred >= DATE_SUB(NOW(), INTERVAL 7 DAY)
-            GROUP BY DATE(time_occurred), DAYNAME(time_occurred)
-            ORDER BY DATE(time_occurred)
+            FROM dbo.exception_logs
+            WHERE time_occurred >= DATEADD(DAY, -7, GETDATE())
+            GROUP BY CAST(time_occurred AS DATE), DATENAME(WEEKDAY, time_occurred)
+            ORDER BY CAST(time_occurred AS DATE)
         """)
 
     elif time_range == "monthly":
         query = text("""
             SELECT 
-                CONCAT('Week ', FLOOR((DAY(time_occurred) - 1) / 7) + 1) AS label,
-                FLOOR((DAY(time_occurred) - 1) / 7) + 1 AS period,
+                CONCAT('Week ', ((DATEPART(DAY, time_occurred) - 1) / 7) + 1) AS label,
+                ((DATEPART(DAY, time_occurred) - 1) / 7) + 1 AS period,
                 COUNT(*) AS count
-            FROM exception_logs
-            WHERE MONTH(time_occurred) = MONTH(NOW())
-              AND YEAR(time_occurred) = YEAR(NOW())
+            FROM dbo.exception_logs
+            WHERE MONTH(time_occurred) = MONTH(GETDATE())
+              AND YEAR(time_occurred) = YEAR(GETDATE())
             GROUP BY period, label
             ORDER BY period
         """)
@@ -71,15 +71,15 @@ def fetch_logs_by_trend_analysis(
         query = text("""
             SELECT 
                 CASE 
-                    WHEN QUARTER(time_occurred) = 1 THEN 'Q1 (Jan-Mar)'
-                    WHEN QUARTER(time_occurred) = 2 THEN 'Q2 (Apr-Jun)'
-                    WHEN QUARTER(time_occurred) = 3 THEN 'Q3 (Jul-Sep)'
-                    WHEN QUARTER(time_occurred) = 4 THEN 'Q4 (Oct-Dec)'
+                    WHEN DATEPART(QUARTER, time_occurred) = 1 THEN 'Q1 (Jan-Mar)'
+                    WHEN DATEPART(QUARTER, time_occurred) = 2 THEN 'Q2 (Apr-Jun)'
+                    WHEN DATEPART(QUARTER, time_occurred) = 3 THEN 'Q3 (Jul-Sep)'
+                    WHEN DATEPART(QUARTER, time_occurred) = 4 THEN 'Q4 (Oct-Dec)'
                 END AS label,
-                QUARTER(time_occurred) AS period,
+                DATEPART(QUARTER, time_occurred) AS period,
                 COUNT(*) AS count
-            FROM exception_logs
-            WHERE YEAR(time_occurred) = YEAR(NOW())
+            FROM dbo.exception_logs
+            WHERE YEAR(time_occurred) = YEAR(GETDATE())
             GROUP BY period, label
             ORDER BY period
         """)
@@ -87,11 +87,11 @@ def fetch_logs_by_trend_analysis(
     elif time_range == "yearly":
         query = text("""
             SELECT 
-                MONTHNAME(time_occurred) AS label,
+                DATENAME(MONTH, time_occurred) AS label,
                 MONTH(time_occurred) AS period,
                 COUNT(*) AS count
-            FROM exception_logs
-            WHERE YEAR(time_occurred) = YEAR(NOW())
+            FROM dbo.exception_logs
+            WHERE YEAR(time_occurred) = YEAR(GETDATE())
             GROUP BY period, label
             ORDER BY period
         """)
@@ -195,21 +195,21 @@ def get_exception_piechart(
 ):
     query = """
         SELECT et.exception_name, COUNT(*)
-        FROM employeeinfo.exception_logs el
-        JOIN employeeinfo.Exception_Type et
+        FROM dbo.exception_logs el
+        JOIN dbo.exception_type et
           ON et.exception_type_id = el.exception_type_id
     """
 
     if time_range == "day":
-        query += " WHERE el.time_occurred >= NOW() - INTERVAL 1 DAY"
+        query += " WHERE el.time_occurred >= DATEADD(DAY, -1, GETDATE())"
     elif time_range == "week":
-        query += " WHERE el.time_occurred >= NOW() - INTERVAL 7 DAY"
+        query += " WHERE el.time_occurred >= DATEADD(DAY, -7, GETDATE())"
     elif time_range == "month":
-        query += " WHERE el.time_occurred >= NOW() - INTERVAL 1 MONTH"
+        query += " WHERE el.time_occurred >= DATEADD(MONTH, -1, GETDATE())"
     elif time_range == "quarter":
-        query += " WHERE el.time_occurred >= NOW() - INTERVAL 3 MONTH"
+        query += " WHERE el.time_occurred >= DATEADD(MONTH, -3, GETDATE())"
     elif time_range == "year":
-        query += " WHERE el.time_occurred >= NOW() - INTERVAL 1 YEAR"
+        query += " WHERE el.time_occurred >= DATEADD(YEAR, -1, GETDATE())"
 
     query += " GROUP BY et.exception_name"
 
@@ -224,12 +224,12 @@ def get_exception_piechart(
 def get_user_exception_counts(db: Session = Depends(get_db)):
     """
     Kept route path for frontend compatibility.
-    New exception_logs schema uses exception_type_id; resolve labels from Exception_Type table.
+    New exception_logs schema uses exception_type_id; resolve labels from exception_type table.
     """
     result = db.execute(text("""
         SELECT et.exception_name, COUNT(*)
-        FROM employeeinfo.exception_logs el
-        JOIN employeeinfo.Exception_Type et
+        FROM dbo.exception_logs el
+        JOIN dbo.exception_type et
           ON et.exception_type_id = el.exception_type_id
         GROUP BY et.exception_name
     """)).fetchall()
@@ -243,7 +243,7 @@ def get_user_exception_counts(db: Session = Depends(get_db)):
 def exception_heatmap(db: Session = Depends(get_db)):
     rows = db.execute(text("""
         SELECT time_occurred
-        FROM employeeinfo.exception_logs
+        FROM dbo.exception_logs
     """)).fetchall()
 
     timestamps = [safe_datetime_str(r[0]) for r in rows]
@@ -263,7 +263,7 @@ def exception_heatmap(db: Session = Depends(get_db)):
 def exception_heatmap(db: Session = Depends(get_db)):
     rows = db.execute(text("""
         SELECT time_occurred
-        FROM employeeinfo.exception_logs
+        FROM dbo.exception_logs
     """)).fetchall()
 
     timestamps = [safe_datetime_str(r[0]) for r in rows]

@@ -17,7 +17,7 @@ router = APIRouter(
 def get_models(db: Session = Depends(get_db)):
     """Get all registered models."""
     try:
-        result = db.execute(text("SELECT * FROM employeeinfo.models"))
+        result = db.execute(text("SELECT * FROM dbo.models"))
         models = result.mappings().all()
         return models
     except Exception as e:

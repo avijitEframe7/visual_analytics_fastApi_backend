@@ -85,7 +85,7 @@ USER_SELECTION_TO_VIOLATION: dict = {
     "safety_shoes": ["no_safetyshoes"],
 }
 
-# Exception log: violations to insert into employeeinfo.exception_logs (notification feed)
+# Exception log: violations to insert into dbo.exception_logs (notification feed)
 VIOLATION_CLASSES_FOR_LOG = frozenset({"no_helmet", "no_vest", "no_goggles", "no_safetyshoes"})
 EXCEPTION_LOG_THROTTLE_SECONDS = 180
 EXCEPTION_LOG_QUEUE_SIZE = 32
@@ -596,7 +596,7 @@ def _detection_frames_worker():
 # Exception-log worker (queue → disk → DB + email enqueue)
 # -----------------------------------------------------------------------------
 def _exception_log_worker():
-    """Background thread: consume exception_log_queue, save annotated frame (with violation boxes) to disk, INSERT into employeeinfo.exception_logs."""
+    """Background thread: consume exception_log_queue, save annotated frame (with violation boxes) to disk, INSERT into dbo.exception_logs."""
     try:
         os.makedirs(EXCEPTION_LOGS_DIR, exist_ok=True)
         print(f"[camera_dashboard] Exception-log worker started; saving to: {EXCEPTION_LOGS_DIR}")
@@ -628,16 +628,17 @@ def _exception_log_worker():
         try:
             db.execute(
                 text("""
-                    INSERT INTO employeeinfo.exception_logs
+                    INSERT INTO dbo.exception_logs
                     (time_occurred, exception_type_id, Incident_image, updated_at)
                     VALUES (
                         :t,
                         (SELECT et.exception_type_id
-                         FROM employeeinfo.Exception_Type et
+                         FROM dbo.exception_type et
                          WHERE et.exception_name = :x
-                         LIMIT 1),
+                         ORDER BY et.exception_type_id
+                         OFFSET 0 ROWS FETCH NEXT 1 ROWS ONLY),
                         :i,
-                        NOW()
+                        GETDATE()
                     )
                 """),
                 {"t": time_occurred, "x": exception_type, "i": image_path},
@@ -784,7 +785,7 @@ router = APIRouter(
 
 @router.get("/cameras")
 def get_cameras():
-    """Get list of all available cameras from employeeinfo.camera."""
+    """Get list of all available cameras from dbo.camera."""
     try:
         camera_config = get_camera_config()
         cameras = {
@@ -811,7 +812,7 @@ class StartBody(BaseModel):
 
 
 def _mark_streams_started(camera_ids: List[str]):
-    """Insert running rows into employeeinfo.camera_streams for current live session."""
+    """Insert running rows into dbo.camera_streams for current live session."""
     db = SessionLocal()
     try:
         for cam_id in camera_ids:
@@ -821,8 +822,8 @@ def _mark_streams_started(camera_ids: List[str]):
             db.execute(
                 text(
                     """
-                    INSERT INTO employeeinfo.camera_streams (camera_id, video_feed_url, status, started_at)
-                    VALUES (:camera_id, :video_feed_url, 'running', NOW())
+                    INSERT INTO dbo.camera_streams (camera_id, video_feed_url, status, started_at)
+                    VALUES (:camera_id, :video_feed_url, 'running', GETDATE())
                     """
                 ),
                 {"camera_id": int(cam_id), "video_feed_url": stream_url},
@@ -847,8 +848,8 @@ def _mark_streams_stopped(camera_ids: List[str]):
             db.execute(
                 text(
                     """
-                    UPDATE employeeinfo.camera_streams
-                    SET status = 'stopped', stopped_at = NOW()
+                    UPDATE dbo.camera_streams
+                    SET status = 'stopped', stopped_at = GETDATE()
                     WHERE camera_id = :camera_id AND status = 'running'
                     """
                 ),

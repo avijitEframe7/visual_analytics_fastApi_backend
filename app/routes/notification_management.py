@@ -55,16 +55,16 @@ def get_notifications(db: Session = Depends(get_db)):
         result = db.execute(
             text("""
                 SELECT
+                    TOP 12
                     el.log_id,
                     et.exception_name AS Exception_Type,
                     el.Incident_image,
                     el.time_occurred,
                     el.updated_at
-                FROM employeeinfo.exception_logs el
-                JOIN employeeinfo.Exception_Type et
+                FROM dbo.exception_logs el
+                JOIN dbo.exception_type et
                   ON et.exception_type_id = el.exception_type_id
                 ORDER BY time_occurred DESC
-                LIMIT 12
             """)
         )
         rows = result.mappings().all()
