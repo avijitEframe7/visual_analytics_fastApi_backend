@@ -232,6 +232,38 @@ def _pipeline_index_to_db_camera_id(cam_index) -> int:
     return idx
 
 
+def _db_str_cell(val) -> Optional[str]:
+    if val is None:
+        return None
+    if isinstance(val, bytes):
+        try:
+            return val.decode("utf-8").strip() or None
+        except UnicodeDecodeError:
+            return None
+    s = str(val).strip()
+    return s or None
+
+
+def _camera_name_zone_from_db(db, camera_id: int) -> Tuple[Optional[str], Optional[str]]:
+    """Load camera_name and zone_name from dbo.camera for emails (same source as SSMS)."""
+    row = db.execute(
+        text(
+            """
+            SELECT TOP 1
+                camera_name,
+                zone_name
+            FROM dbo.camera
+            WHERE camera_id = :cid
+            """
+        ),
+        {"cid": camera_id},
+    ).mappings().first()
+    if not row:
+        return None, None
+    m = {k.lower(): v for k, v in dict(row).items()}
+    return _db_str_cell(m.get("camera_name")), _db_str_cell(m.get("zone_name"))
+
+
 def _ensure_detection_log_file():
     """
     Ensure that the plain-text detections log file exists so it is visible
@@ -773,13 +805,16 @@ def _exception_log_worker():
                 f"exception_log: DB insert OK for {exception_type} (exception_type_id={et_id}) "
                 f"camera_id={db_camera_id}"
             )
-            # Enqueue an email notification; this is non-blocking (just adds to a queue).
+            # Enqueue email with camera name + zone from dbo.camera (direct query on open session).
             try:
+                em_name, em_zone = _camera_name_zone_from_db(db, db_camera_id)
                 enqueue_violation_email(
                     camera_id=db_camera_id,
                     exception_type=exception_type,
                     image_path=image_path,
                     time_occurred=time_occurred,
+                    camera_name=em_name,
+                    zone_name=em_zone,
                 )
             except Exception as e:
                 # Do not break logging if email enqueue fails.

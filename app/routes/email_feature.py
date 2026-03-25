@@ -136,15 +136,31 @@ def _ensure_email_worker() -> None:
         _email_worker_started = True
 
 
+def _format_camera_line_for_email(
+    camera_id: int,
+    camera_name: Optional[str],
+    zone_name: Optional[str],
+) -> str:
+    """Match notifications UI: Name · Zone: … (no IP)."""
+    name = (camera_name or "").strip() or f"Camera ID {camera_id}"
+    if zone_name and str(zone_name).strip():
+        return f"{name} · Zone: {zone_name.strip()}"
+    return name
+
+
 def enqueue_violation_email(
     camera_id: int,
     exception_type: str,
     image_path: str,
     time_occurred: str,
+    *,
+    camera_name: Optional[str] = None,
+    zone_name: Optional[str] = None,
 ) -> None:
     """
     Non-blocking API used by other modules (e.g. camera_dashboard) to request an email.
     This ONLY enqueues; actual sending is done in a dedicated worker thread.
+    Pass camera_name and zone_name from dbo.camera.
     """
     global _email_config_warning_logged
 
@@ -161,15 +177,17 @@ def enqueue_violation_email(
 
     _ensure_email_worker()
 
-    subject = f"PPE Violation: {exception_type} (Camera {camera_id})"
+    display_name = (camera_name or "").strip() or f"Camera {camera_id}"
+    camera_line = _format_camera_line_for_email(camera_id, camera_name, zone_name)
+    subject = f"PPE Violation: {exception_type} — {display_name}"
     lines = [
-        f"PPE violation detected.",
-        f"Camera ID   : {camera_id}",
+        "PPE violation detected.",
+        "",
+        f"Camera: {camera_line}",
+        "",
         f"Violation   : {exception_type}",
         f"Time        : {time_occurred}",
     ]
-    if image_path:
-        lines.append(f"Image path  : {image_path}")
     body = "\n".join(lines)
 
     payload = {
