@@ -4,7 +4,7 @@ from sqlalchemy import text
 from datetime import datetime, timedelta
 import calendar
 from collections import Counter
-from typing import Any
+from typing import Any, List, Dict
 import io
 
 from fastapi.responses import StreamingResponse
@@ -220,6 +220,110 @@ def get_exception_piechart(
         for r in result
     ]
 
+
+def _exception_logs_time_sql_fragment(time_range: str, table_alias: str = "el") -> str:
+    """Append to WHERE ... for dbo.exception_logs time filtering (matches exception_piechart)."""
+    col = f"{table_alias}.time_occurred"
+    if time_range == "all" or not time_range:
+        return ""
+    if time_range == "day":
+        return f" AND {col} >= DATEADD(DAY, -1, GETDATE())"
+    if time_range == "week":
+        return f" AND {col} >= DATEADD(DAY, -7, GETDATE())"
+    if time_range == "month":
+        return f" AND {col} >= DATEADD(MONTH, -1, GETDATE())"
+    if time_range == "quarter":
+        return f" AND {col} >= DATEADD(MONTH, -3, GETDATE())"
+    if time_range == "year":
+        return f" AND {col} >= DATEADD(YEAR, -1, GETDATE())"
+    raise HTTPException(
+        status_code=400,
+        detail="Invalid time_range. Use all, day, week, month, quarter, or year.",
+    )
+
+
+@router.get("/camera_zone_violations")
+def get_camera_zone_violations(
+    time_range: str = Query("week", description="all | day | week | month | quarter | year"),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """
+    Violation counts by zone and by camera for dashboard charts.
+    Uses dbo.exception_logs + dbo.camera; includes all cameras with zero counts in by_camera.
+    """
+    tr = (time_range or "week").strip().lower()
+    time_and = _exception_logs_time_sql_fragment(tr, "el")
+
+    # --- By zone (includes unknown camera / unassigned zone buckets)
+    zone_sql = f"""
+        SELECT
+            CASE
+                WHEN el.camera_id IS NULL THEN N'Unknown camera'
+                ELSE ISNULL(NULLIF(LTRIM(RTRIM(c.zone_name)), N''), N'Unassigned')
+            END AS zone_name,
+            COUNT(*) AS violation_count
+        FROM dbo.exception_logs el
+        LEFT JOIN dbo.camera c ON c.camera_id = el.camera_id
+        WHERE 1 = 1
+        {time_and}
+        GROUP BY
+            CASE
+                WHEN el.camera_id IS NULL THEN N'Unknown camera'
+                ELSE ISNULL(NULLIF(LTRIM(RTRIM(c.zone_name)), N''), N'Unassigned')
+            END
+        ORDER BY violation_count DESC
+    """
+
+    # --- By camera (every row in dbo.camera; zero if no matching logs in range)
+    join_time = _exception_logs_time_sql_fragment(tr, "el")
+
+    camera_sql = f"""
+        SELECT
+            c.camera_id,
+            c.camera_name,
+            c.zone_name,
+            COUNT(el.log_id) AS violation_count
+        FROM dbo.camera c
+        LEFT JOIN dbo.exception_logs el ON el.camera_id = c.camera_id{join_time}
+        GROUP BY c.camera_id, c.camera_name, c.zone_name
+        ORDER BY violation_count DESC, c.camera_id
+    """
+
+    try:
+        zone_rows = db.execute(text(zone_sql)).fetchall()
+        cam_rows = db.execute(text(camera_sql)).fetchall()
+        total_cams = db.execute(text("SELECT COUNT(*) AS n FROM dbo.camera")).scalar()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+    by_zone: List[Dict[str, Any]] = []
+    for r in zone_rows:
+        by_zone.append(
+            {
+                "zone": decode_bytes(r[0]),
+                "count": int(r[1]),
+            }
+        )
+
+    by_camera: List[Dict[str, Any]] = []
+    for r in cam_rows:
+        by_camera.append(
+            {
+                "camera_id": int(r[0]) if r[0] is not None else None,
+                "camera_name": decode_bytes(r[1]) if r[1] is not None else "",
+                "zone_name": decode_bytes(r[2]) if r[2] is not None else "",
+                "count": int(r[3]),
+            }
+        )
+
+    return {
+        "time_range": tr,
+        "total_cameras": int(total_cams or 0),
+        "by_zone": by_zone,
+        "by_camera": by_camera,
+    }
+
+
 @router.get("/bargraph-user-exception-counts")
 def get_user_exception_counts(db: Session = Depends(get_db)):
     """
@@ -237,26 +341,6 @@ def get_user_exception_counts(db: Session = Depends(get_db)):
     return {
         "usernames": [decode_bytes(r[0]) for r in result],
         "exception_counts": [int(r[1]) for r in result]
-    }
-
-@router.get("/exception-heatmap")
-def exception_heatmap(db: Session = Depends(get_db)):
-    rows = db.execute(text("""
-        SELECT time_occurred
-        FROM dbo.exception_logs
-    """)).fetchall()
-
-    timestamps = [safe_datetime_str(r[0]) for r in rows]
-    counter = Counter(timestamps)
-
-    x = list(counter.keys())
-    y = list(counter.values())
-
-    return {
-        "x": x,
-        "y": y,
-        "max_count": max(y) if y else 0,
-        "max_time": x[y.index(max(y))] if y else None
     }
 
 @router.get("/exception-heatmap")
