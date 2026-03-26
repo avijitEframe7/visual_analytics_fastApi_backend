@@ -23,7 +23,7 @@ router = APIRouter(
 # ======================
 
 # Receiver
-RECEIVER_EMAIL = "avijit.eframe@gmail.com"
+RECEIVER_EMAIL = "shounak@eframe.in"
 
 GMAIL_ADDRESS: Optional[str] = "eframeinterns@gmail.com"
 GMAIL_APP_PASSWORD: Optional[str] = "ibfx koos skrd rinb"

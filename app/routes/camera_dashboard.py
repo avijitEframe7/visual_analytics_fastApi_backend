@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -9,11 +10,12 @@ import threading
 import time
 from datetime import datetime
 from typing import Any, List, Optional, Set, Tuple
+from urllib.parse import quote, unquote
 
 import cv2
 import numpy as np
 import torch
-from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import text
@@ -124,6 +126,10 @@ DETECTION_FRAMES_DIR = os.path.abspath(os.path.join(MEDIA_ROOT, "detection_frame
 DETECTION_LOG_FILE = os.path.abspath(os.path.join(MEDIA_ROOT, "logs.txt"))
 EXCEPTION_PIPELINE_LOG_PATH = os.path.abspath(os.path.join(MEDIA_ROOT, "exception_pipeline.log"))
 
+# Uploaded file analysis (demo2/3/4): stored under media/uploads
+UPLOAD_FOLDER = os.path.abspath(os.path.join(MEDIA_ROOT, "uploads"))
+ALLOWED_UPLOAD_EXTENSIONS = frozenset({"mp4", "avi", "mov", "mkv", "jpg", "jpeg", "png"})
+
 _exception_pipeline_logger: Optional[logging.Logger] = None
 
 
@@ -209,6 +215,13 @@ _debug_lock = threading.Lock()
 
 # Stop signal for live detection pipeline
 pipeline_stop_event = threading.Event()
+
+# File upload / recorded video analysis (demo2, demo3, demo4)
+video_processing_active = False
+current_processing_type: Optional[str] = None
+current_processing_video_path: Optional[str] = None
+video_processing_stop_requested = False
+file_analysis_selected_classes: List[str] = []
 
 # Ordered camera ids for current pipeline (index = display queue index)
 current_camera_ids: List[str] = []
@@ -309,6 +322,419 @@ def _ensure_model_loaded():
                 sys.exit(1)
             raise
     print(f"[camera_dashboard] GPU: {gpu_name} | Model: {os.path.basename(MODEL_PATH)}")
+
+
+# -----------------------------------------------------------------------------
+# File upload analysis: helpers + MJPEG generators (demo2 / demo3 / demo4)
+# -----------------------------------------------------------------------------
+def _allowed_upload_file(filename: Optional[str]) -> bool:
+    if not filename or "." not in filename:
+        return False
+    ext = filename.rsplit(".", 1)[1].lower()
+    return ext in ALLOWED_UPLOAD_EXTENSIONS
+
+
+def _secure_upload_filename(filename: str) -> str:
+    base = os.path.basename(filename).replace("..", "")
+    cleaned = re.sub(r"[^a-zA-Z0-9._-]", "_", base)
+    return cleaned or "upload.bin"
+
+
+def _safe_path_under_upload(video_path: str) -> Optional[str]:
+    """Reject path traversal; only files under UPLOAD_FOLDER."""
+    if not video_path:
+        return None
+    try:
+        decoded = unquote(video_path)
+        abs_path = os.path.abspath(decoded)
+        root = os.path.abspath(UPLOAD_FOLDER)
+        if not abs_path.startswith(root + os.sep) and abs_path != root:
+            return None
+        if not os.path.isfile(abs_path):
+            return None
+        return abs_path
+    except Exception:
+        return None
+
+
+def _file_analysis_frame_period_sec(cap: cv2.VideoCapture) -> float:
+    """Target seconds between frames to match the source file's nominal FPS (playback speed)."""
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    if fps <= 1.0 or fps > 120.0:
+        fps = 25.0
+    return 1.0 / fps
+
+
+def _file_analysis_pace_realtime(period_sec: float, loop_start: float) -> None:
+    """Sleep so wall time since loop_start reaches one frame period (original playback speed)."""
+    elapsed = time.perf_counter() - loop_start
+    rem = period_sec - elapsed
+    if rem > 0:
+        time.sleep(rem)
+
+
+def _yolo_all_class_indices() -> List[int]:
+    _ensure_model_loaded()
+    names = model.names
+    if isinstance(names, dict):
+        return list(names.keys())
+    return list(range(len(names)))
+
+
+def generate_processed_frames2(video_path: str):
+    """YOLO-processed MJPEG stream from a video file (general detection)."""
+    global video_processing_stop_requested, model
+    global video_processing_active, current_processing_video_path, current_processing_type
+    _ensure_model_loaded()
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        video_processing_active = False
+        current_processing_video_path = None
+        current_processing_type = None
+        return
+    frame_period = _file_analysis_frame_period_sec(cap)
+    frame_counter = 0
+    try:
+        while True:
+            loop_t0 = time.perf_counter()
+            if video_processing_stop_requested:
+                break
+            success, img = cap.read()
+            if not success:
+                break
+            frame_counter += 1
+            if img is None or img.size == 0:
+                continue
+            curr_datetime = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            try:
+                all_class_indices = _yolo_all_class_indices()
+                results = model.predict(
+                    img, conf=0.25, iou=0.45, classes=all_class_indices, verbose=False
+                )
+            except Exception as yolo_error:
+                print(f"[file_analysis] YOLO error frame {frame_counter}: {yolo_error}")
+                continue
+            try:
+                annotated_img = img
+                for r in results:
+                    if r is not None:
+                        annotated_img = r.plot()
+                        break
+                for r in results:
+                    if r is None:
+                        continue
+                    boxes = r.boxes
+                    if boxes is None:
+                        break
+                    for box in boxes:
+                        conf = math.ceil((box.conf[0] * 100)) / 100
+                        cls = int(box.cls[0])
+                        raw = model.names.get(cls, str(cls)) if isinstance(model.names, dict) else (
+                            model.names[cls] if cls < len(model.names) else str(cls)
+                        )
+                        current_class = str(raw)
+                        violation_classes = [
+                            "NO_helmet",
+                            "NO_Vest",
+                            "NO_goggles",
+                            "NO_SafetyShoes",
+                            "NO_Gloves",
+                        ]
+                        is_violation = current_class in violation_classes
+                        if conf > 0.5 and is_violation:
+                            try:
+                                face_dir = os.path.join(MEDIA_ROOT, "face_detect")
+                                os.makedirs(face_dir, exist_ok=True)
+                                cv2.imwrite(
+                                    os.path.join(face_dir, f"output{curr_datetime}.jpg"),
+                                    annotated_img,
+                                )
+                                cv2.imwrite(os.path.join(face_dir, "output.jpg"), annotated_img)
+                            except Exception as write_error:
+                                print(f"[file_analysis] save violation image: {write_error}")
+                    break
+                img = annotated_img
+            except Exception as results_error:
+                print(f"[file_analysis] results error frame {frame_counter}: {results_error}")
+                continue
+            img = cv2.resize(img, (640, 480))
+            if img is None or img.size == 0:
+                continue
+            ok, buffer = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            if not ok or buffer is None:
+                continue
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
+            )
+            _file_analysis_pace_realtime(frame_period, loop_t0)
+    except Exception as e:
+        print(f"[file_analysis] stream error: {e}")
+    finally:
+        cap.release()
+        video_processing_stop_requested = False
+        video_processing_active = False
+        current_processing_video_path = None
+        current_processing_type = None
+
+
+def generate_processed_frames3(video_path: str):
+    """Zone-based PPE MJPEG stream (vertical divider)."""
+    global video_processing_stop_requested, model
+    global video_processing_active, current_processing_video_path, current_processing_type
+    _ensure_model_loaded()
+    CONF_THRES = 0.25
+    IOU_THRES = 0.45
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        video_processing_active = False
+        current_processing_video_path = None
+        current_processing_type = None
+        return
+    frame_period = _file_analysis_frame_period_sec(cap)
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    x_mid = W // 2
+    divider = [x_mid, 0, x_mid, H - 1]
+    zone_names = ("LEFT", "RIGHT")
+    x1, y1, x2, y2 = divider
+    CLR_LINE = (255, 255, 255)
+
+    def point_side_of_line(px, py, ax1, ay1, ax2, ay2):
+        return (ax2 - ax1) * (py - ay1) - (ay2 - ay1) * (px - ax1)
+
+    def draw_label(img, text, x, y, color=(255, 255, 255), bg=(0, 0, 0)):
+        (tw, th), base = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        cv2.rectangle(img, (x, y - th - 6), (x + tw + 6, y + 2), bg, -1)
+        cv2.putText(img, text, (x + 3, y - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+
+    try:
+        while True:
+            loop_t0 = time.perf_counter()
+            if video_processing_stop_requested:
+                break
+            success, frame = cap.read()
+            if not success:
+                break
+            results = model.predict(frame, conf=CONF_THRES, iou=IOU_THRES, verbose=False)
+            annotated = frame.copy()
+            dets = results[0].boxes
+            names = model.names
+            if dets is not None and len(dets) > 0:
+                for i in range(len(dets)):
+                    xyxy = dets.xyxy[i].cpu().tolist()
+                    cls = int(dets.cls[i].cpu().item())
+                    conf = float(dets.conf[i].cpu().item())
+                    if isinstance(names, dict):
+                        class_name = str(names.get(cls, str(cls)))
+                    else:
+                        class_name = str(names[cls]) if cls < len(names) else str(cls)
+                    px1, py1, px2, py2 = [int(c) for c in xyxy]
+                    if class_name.lower() == "person":
+                        pcx, pcy = (px1 + px2) / 2, (py1 + py2) / 2
+                        sign = point_side_of_line(pcx, pcy, x1, y1, x2, y2)
+                        zone = zone_names[0] if sign > 0 else zone_names[1] if sign < 0 else "ON_LINE"
+                        if zone == zone_names[1]:
+                            cv2.rectangle(annotated, (px1, py1), (px2, py2), (0, 255, 0), 2)
+                            draw_label(annotated, "OK", px1, py1 - 10, color=(255, 255, 255), bg=(0, 255, 0))
+                        else:
+                            cv2.rectangle(annotated, (px1, py1), (px2, py2), (0, 255, 0), 2)
+                            cv2.putText(
+                                annotated,
+                                f"{class_name} {conf:.2f}",
+                                (px1, py1 - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.5,
+                                (0, 255, 0),
+                                2,
+                            )
+                            draw_label(
+                                annotated,
+                                f"Zone: {zone}",
+                                px1,
+                                py1 - 30,
+                                color=(255, 255, 255),
+                                bg=(0, 0, 255),
+                            )
+                    else:
+                        dcx, dcy = (px1 + px2) / 2, (py1 + py2) / 2
+                        sign = point_side_of_line(dcx, dcy, x1, y1, x2, y2)
+                        zone = zone_names[0] if sign > 0 else zone_names[1] if sign < 0 else "ON_LINE"
+                        if zone == zone_names[0] or sign == 0:
+                            cv2.rectangle(annotated, (px1, py1), (px2, py2), (0, 255, 0), 2)
+                            cv2.putText(
+                                annotated,
+                                f"{class_name} {conf:.2f}",
+                                (px1, py1 - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.5,
+                                (0, 255, 0),
+                                2,
+                            )
+                            if conf > 0.5 and class_name in [
+                                "NO_helmet",
+                                "NO_Vest",
+                                "NO_goggles",
+                                "NO_safetyshoes",
+                            ]:
+                                zdir = os.path.join(MEDIA_ROOT, "zone_based")
+                                os.makedirs(zdir, exist_ok=True)
+                                ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                                cv2.imwrite(os.path.join(zdir, f"output_{ts}.jpg"), annotated)
+                                cv2.imwrite(os.path.join(zdir, "output.jpg"), annotated)
+            cv2.line(annotated, (int(x1), int(y1)), (int(x2), int(y2)), CLR_LINE, 2)
+            draw_label(
+                annotated,
+                "AUTO DIVIDER (VERTICAL)",
+                int((x1 + x2) / 2),
+                int((y1 + y2) / 2) - 6,
+                color=(0, 0, 0),
+                bg=(255, 255, 255),
+            )
+            cv2.putText(
+                annotated,
+                f"Zone Analysis: {zone_names[0]} / {zone_names[1]}",
+                (10, 20),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+            if annotated.shape[1] > 1920 or annotated.shape[0] > 1080:
+                scale = min(1920 / annotated.shape[1], 1080 / annotated.shape[0])
+                nw, nh = int(annotated.shape[1] * scale), int(annotated.shape[0] * scale)
+                annotated = cv2.resize(annotated, (nw, nh), interpolation=cv2.INTER_LANCZOS4)
+            _, buffer = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
+            )
+            _file_analysis_pace_realtime(frame_period, loop_t0)
+    except Exception as e:
+        print(f"[file_analysis] zone stream error: {e}")
+    finally:
+        cap.release()
+        video_processing_stop_requested = False
+        video_processing_active = False
+        current_processing_video_path = None
+        current_processing_type = None
+
+
+def generate_processed_frames4(video_path: str):
+    """Class-filtered YOLO MJPEG stream."""
+    global video_processing_stop_requested, model
+    global video_processing_active, current_processing_video_path, current_processing_type
+    _ensure_model_loaded()
+    selected_classes = list(file_analysis_selected_classes) or ["helmet", "shoes", "pvc_suit"]
+
+    ALIASES = {
+        "person": {"person", "Person"},
+        "helmet": {"helmet", "hardhat", "safety_helmet", "Helmet"},
+        "safety_vest": {"vest", "safety_vest", "Safety_Vestr"},
+        "no_helmet": {"no_helmet", "no_safety_helmet", "no_hardhat", "NO_helmet"},
+        "no_safety_vest": {"no_vest", "no_safety_vest", "NO_Vestr"},
+        "pvc_suit": {"pvc_suit", "suit"},
+        "no_pvc_suit": {"no_pvc_suit", "no_suit"},
+        "shoes": {"shoes", "safety_shoes", "boots", "Safety Shoes"},
+        "goggles": {"goggles", "safety_goggles", "glasses", "eye_protection", "Safety Goggles"},
+        "no_safety_shoes": {"no_shoes", "NO_safetyshoes", "no_boots", "no_safety_shoes"},
+        "no_goggles": {"no_goggles", "NO_goggles", "no_eye_protection", "no_safety_goggles"},
+    }
+
+    def canonicalize(name: str) -> str:
+        n = name.lower().replace(" ", "_")
+        for canon, synonyms in ALIASES.items():
+            if n == canon or n in synonyms:
+                return canon
+        return n
+
+    detect_classes_names: Set[str] = set()
+    required_ppe: Set[str] = set()
+    if selected_classes:
+        user_ppe_types = set()
+        for cls_name in selected_classes:
+            cn = canonicalize(cls_name)
+            if cn.startswith("no_"):
+                user_ppe_types.add(cn[3:])
+            else:
+                user_ppe_types.add(cn)
+        required_ppe = user_ppe_types
+        for ppe_type in required_ppe:
+            detect_classes_names.add(ppe_type)
+            detect_classes_names.add(f"no_{ppe_type}")
+    else:
+        required_ppe = {"helmet", "shoes", "goggles", "safety_vest", "pvc_suit"}
+        for ppe_type in required_ppe:
+            detect_classes_names.add(ppe_type)
+            detect_classes_names.add(f"no_{ppe_type}")
+    detect_classes_names.add("person")
+
+    names = model.names
+    model_class_map: dict = {}
+    if isinstance(names, dict):
+        for idx, name in names.items():
+            model_class_map[canonicalize(str(name))] = int(idx)
+    else:
+        for idx, name in enumerate(names):
+            model_class_map[canonicalize(str(name))] = idx
+
+    detect_class_indices: List[int] = []
+    for name in detect_classes_names:
+        if name in model_class_map:
+            detect_class_indices.append(model_class_map[name])
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        video_processing_active = False
+        current_processing_video_path = None
+        current_processing_type = None
+        return
+    frame_period = _file_analysis_frame_period_sec(cap)
+    frame_count = 0
+    consecutive_errors = 0
+    max_consecutive_errors = 5
+    try:
+        while True:
+            if video_processing_stop_requested:
+                break
+            try:
+                loop_t0 = time.perf_counter()
+                success, frame = cap.read()
+                if not success:
+                    break
+                frame_count += 1
+                consecutive_errors = 0
+                results = model.predict(
+                    frame,
+                    conf=0.3,
+                    iou=0.5,
+                    classes=detect_class_indices if detect_class_indices else None,
+                    verbose=False,
+                )
+                annotated_frame = results[0].plot()
+                annotated_frame = cv2.resize(annotated_frame, (640, 480))
+                _, buffer = cv2.imencode(
+                    ".jpg", annotated_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+                )
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
+                )
+                _file_analysis_pace_realtime(frame_period, loop_t0)
+            except Exception as frame_error:
+                consecutive_errors += 1
+                if consecutive_errors >= max_consecutive_errors:
+                    break
+                continue
+    except Exception as e:
+        print(f"[file_analysis] class-based stream error: {e}")
+    finally:
+        cap.release()
+        video_processing_stop_requested = False
+        video_processing_active = False
+        current_processing_video_path = None
+        current_processing_type = None
 
 
 # -----------------------------------------------------------------------------
@@ -945,6 +1371,9 @@ router = APIRouter(
     dependencies=[Depends(require_permission("camera-dashboard.view"))],
 )
 
+# MJPEG file-analysis feeds must be reachable without Authorization (browser <img> cannot send Bearer).
+public_feed_router = APIRouter(prefix="/api/camera_dashboard", tags=["camera_dashboard"])
+
 
 @router.get("/cameras")
 def get_cameras():
@@ -1375,4 +1804,199 @@ def api_stop_live_detection():
     pipeline_stop_event.set()
     _mark_streams_stopped(current_camera_ids)
     return {"status": "success"}
+
+
+# --- File upload analysis (demo2, demo3, demo4) — matches frontend FileAnalysis.jsx + apiConfig ---
+
+
+@router.post("/demo2")
+async def file_analysis_demo2(file: UploadFile = File(...)):
+    global video_processing_active, current_processing_type, current_processing_video_path
+    global video_processing_stop_requested
+    if not file.filename:
+        raise HTTPException(status_code=400, detail={"status": "error", "error": "No selected file"})
+    if not _allowed_upload_file(file.filename):
+        raise HTTPException(status_code=400, detail={"status": "error", "error": "Invalid file type"})
+    try:
+        os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+        filename = _secure_upload_filename(file.filename)
+        sample_path = os.path.abspath(os.path.join(UPLOAD_FOLDER, filename))
+        content = await file.read()
+        with open(sample_path, "wb") as f:
+            f.write(content)
+        video_processing_active = True
+        current_processing_type = "general"
+        current_processing_video_path = sample_path
+        video_processing_stop_requested = False
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_filename = f"output_{timestamp}_{filename}"
+        vp = quote(sample_path, safe="")
+        video_feed_url = f"/api/camera_dashboard/video_feed2?video_path={vp}"
+        download_url = f"/static/uploads/{output_filename}"
+        return {
+            "status": "success",
+            "video_feed_url": video_feed_url,
+            "download_url": download_url,
+            "message": "File uploaded successfully",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail={"status": "error", "error": f"Processing failed: {str(e)}"},
+        )
+
+
+@router.post("/demo3")
+async def file_analysis_demo3(file: UploadFile = File(...)):
+    global video_processing_active, current_processing_type, current_processing_video_path, video_processing_stop_requested
+    if not file.filename:
+        raise HTTPException(status_code=400, detail={"status": "error", "error": "No selected file"})
+    if not _allowed_upload_file(file.filename):
+        raise HTTPException(status_code=400, detail={"status": "error", "error": "Invalid file type"})
+    try:
+        os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+        filename = _secure_upload_filename(file.filename)
+        sample_path = os.path.abspath(os.path.join(UPLOAD_FOLDER, filename))
+        content = await file.read()
+        with open(sample_path, "wb") as f:
+            f.write(content)
+        video_processing_active = True
+        current_processing_type = "zone"
+        current_processing_video_path = sample_path
+        video_processing_stop_requested = False
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_filename = f"output_{timestamp}_{filename}"
+        vp = quote(sample_path, safe="")
+        video_feed_url = f"/api/camera_dashboard/video_feed3?video_path={vp}"
+        download_url = f"/static/uploads/{output_filename}"
+        return {
+            "status": "success",
+            "video_feed_url": video_feed_url,
+            "download_url": download_url,
+            "message": "File uploaded successfully",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail={"status": "error", "error": f"Processing failed: {str(e)}"},
+        )
+
+
+@router.post("/demo4")
+async def file_analysis_demo4(
+    file: UploadFile = File(...),
+    classes: Optional[str] = Form("[]"),
+):
+    global video_processing_active, current_processing_type, current_processing_video_path, video_processing_stop_requested
+    global file_analysis_selected_classes
+    if not file.filename:
+        raise HTTPException(status_code=400, detail={"status": "error", "error": "No selected file"})
+    if not _allowed_upload_file(file.filename):
+        raise HTTPException(status_code=400, detail={"status": "error", "error": "Invalid file type"})
+    try:
+        selected_classes = json.loads(classes) if classes else []
+        if not isinstance(selected_classes, list):
+            selected_classes = ["helmet", "shoes", "pvc_suit"]
+    except json.JSONDecodeError:
+        selected_classes = ["helmet", "shoes", "pvc_suit"]
+    try:
+        os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+        filename = _secure_upload_filename(file.filename)
+        sample_path = os.path.abspath(os.path.join(UPLOAD_FOLDER, filename))
+        content = await file.read()
+        with open(sample_path, "wb") as f:
+            f.write(content)
+        video_processing_active = True
+        current_processing_type = "class"
+        current_processing_video_path = sample_path
+        video_processing_stop_requested = False
+        file_analysis_selected_classes = [str(x) for x in selected_classes]
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_filename = f"output_{timestamp}_{filename}"
+        vp = quote(sample_path, safe="")
+        video_feed_url = f"/api/camera_dashboard/video_feed4?video_path={vp}"
+        download_url = f"/static/uploads/{output_filename}"
+        return {
+            "status": "success",
+            "video_feed_url": video_feed_url,
+            "download_url": download_url,
+            "message": f"File uploaded successfully with classes: {file_analysis_selected_classes}",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail={"status": "error", "error": f"Processing failed: {str(e)}"},
+        )
+
+
+def _mjpeg_stream(gen):
+    return StreamingResponse(
+        gen,
+        media_type="multipart/x-mixed-replace; boundary=frame",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
+
+
+@public_feed_router.get("/video_feed2")
+def file_analysis_video_feed2(video_path: str):
+    safe = _safe_path_under_upload(unquote(video_path))
+    if not safe:
+        raise HTTPException(status_code=404, detail={"status": "error", "error": "Invalid video path"})
+    return _mjpeg_stream(generate_processed_frames2(safe))
+
+
+@public_feed_router.get("/video_feed3")
+def file_analysis_video_feed3(video_path: str):
+    safe = _safe_path_under_upload(unquote(video_path))
+    if not safe:
+        raise HTTPException(status_code=404, detail={"status": "error", "error": "Invalid video path"})
+    return _mjpeg_stream(generate_processed_frames3(safe))
+
+
+@public_feed_router.get("/video_feed4")
+def file_analysis_video_feed4(video_path: str):
+    safe = _safe_path_under_upload(unquote(video_path))
+    if not safe:
+        raise HTTPException(status_code=404, detail={"status": "error", "error": "Invalid video path"})
+    return _mjpeg_stream(generate_processed_frames4(safe))
+
+
+@router.post("/stop_video_processing")
+def file_analysis_stop_video_processing():
+    global video_processing_active, current_processing_type, current_processing_video_path, video_processing_stop_requested
+    try:
+        video_processing_stop_requested = True
+        video_processing_active = False
+        current_processing_type = None
+        current_processing_video_path = None
+        return {"status": "success", "message": "Video processing stopped successfully"}
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "status": "error",
+                "message": "Failed to stop video processing",
+                "error": str(e),
+            },
+        )
+
+
+@router.get("/video_processing_status")
+def file_analysis_video_processing_status():
+    return {
+        "processing_active": video_processing_active,
+        "processing_type": current_processing_type,
+        "video_path": current_processing_video_path,
+        "stop_requested": video_processing_stop_requested,
+    }
 

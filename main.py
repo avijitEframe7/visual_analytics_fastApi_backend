@@ -3,8 +3,10 @@
 
 import logging
 from pathlib import Path
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from app.routes import (
     users,
     health,
@@ -82,11 +84,18 @@ app.include_router(users.router)
 app.include_router(health.router)
 app.include_router(auth.router)
 app.include_router(main_dashboard.router)
+app.include_router(camera_dashboard.public_feed_router)
 app.include_router(camera_dashboard.router)
 app.include_router(model_management.router)
 app.include_router(camera_management.router)
 app.include_router(notification_management.router)
 app.include_router(email_feature.router)
+
+# Serve media/uploads for file-analysis download URLs (/static/uploads/...)
+_media_root = Path(__file__).resolve().parent / "media"
+_media_root.mkdir(parents=True, exist_ok=True)
+(_media_root / "uploads").mkdir(parents=True, exist_ok=True)
+app.mount("/static", StaticFiles(directory=str(_media_root)), name="static")
 
 # Root endpoint
 
