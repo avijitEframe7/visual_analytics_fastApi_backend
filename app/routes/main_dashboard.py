@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import text
+from datetime import date as date_type
 from datetime import datetime, timedelta
 import calendar
 from collections import Counter
@@ -28,6 +29,26 @@ def safe_datetime_str(val: Any) -> str:
         return val.strftime("%Y-%m-%d %H:%M:%S")
     return str(val)
 
+
+def _row_to_date(val: Any):
+    """Normalize SQL date/datetime for comparison with Python date (weekly trend)."""
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val.date()
+    if isinstance(val, date_type):
+        return val
+    return val
+
+
+def _row_period_int(val: Any) -> int:
+    if val is None:
+        return 0
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return int(float(val))
+
 router = APIRouter(
     prefix="/api/main_dashboard",
     tags=["Main Dashboard"],
@@ -42,58 +63,63 @@ def fetch_logs_by_trend_analysis(
     # ----------------------------
     # 1️⃣ Select query by range
     # ----------------------------
+    # SQL Server: cannot GROUP BY SELECT aliases (period, label). Use expressions or subqueries.
     if time_range == "weekly":
         query = text("""
-            SELECT 
-                DATENAME(WEEKDAY, time_occurred) AS label,
-                CAST(time_occurred AS DATE) AS date_val,
+            SELECT
+                DATENAME(WEEKDAY, el.time_occurred) AS label,
+                CAST(el.time_occurred AS DATE) AS date_val,
                 COUNT(*) AS count
-            FROM dbo.exception_logs
-            WHERE time_occurred >= DATEADD(DAY, -7, GETDATE())
-            GROUP BY CAST(time_occurred AS DATE), DATENAME(WEEKDAY, time_occurred)
-            ORDER BY CAST(time_occurred AS DATE)
+            FROM dbo.exception_logs el
+            WHERE el.time_occurred >= DATEADD(DAY, -7, GETDATE())
+            GROUP BY CAST(el.time_occurred AS DATE), DATENAME(WEEKDAY, el.time_occurred)
+            ORDER BY MIN(CAST(el.time_occurred AS DATE))
         """)
 
     elif time_range == "monthly":
         query = text("""
-            SELECT 
-                CONCAT('Week ', ((DATEPART(DAY, time_occurred) - 1) / 7) + 1) AS label,
-                ((DATEPART(DAY, time_occurred) - 1) / 7) + 1 AS period,
+            SELECT
+                wk AS period,
+                CONCAT(N'Week ', wk) AS label,
                 COUNT(*) AS count
-            FROM dbo.exception_logs
-            WHERE MONTH(time_occurred) = MONTH(GETDATE())
-              AND YEAR(time_occurred) = YEAR(GETDATE())
-            GROUP BY period, label
-            ORDER BY period
+            FROM (
+                SELECT
+                    ((DATEPART(DAY, el.time_occurred) - 1) / 7) + 1 AS wk
+                FROM dbo.exception_logs el
+                WHERE MONTH(el.time_occurred) = MONTH(GETDATE())
+                  AND YEAR(el.time_occurred) = YEAR(GETDATE())
+            ) t
+            GROUP BY wk
+            ORDER BY wk
         """)
 
     elif time_range == "quarterly":
         query = text("""
-            SELECT 
-                CASE 
-                    WHEN DATEPART(QUARTER, time_occurred) = 1 THEN 'Q1 (Jan-Mar)'
-                    WHEN DATEPART(QUARTER, time_occurred) = 2 THEN 'Q2 (Apr-Jun)'
-                    WHEN DATEPART(QUARTER, time_occurred) = 3 THEN 'Q3 (Jul-Sep)'
-                    WHEN DATEPART(QUARTER, time_occurred) = 4 THEN 'Q4 (Oct-Dec)'
+            SELECT
+                DATEPART(QUARTER, el.time_occurred) AS period,
+                CASE DATEPART(QUARTER, el.time_occurred)
+                    WHEN 1 THEN N'Q1 (Jan-Mar)'
+                    WHEN 2 THEN N'Q2 (Apr-Jun)'
+                    WHEN 3 THEN N'Q3 (Jul-Sep)'
+                    WHEN 4 THEN N'Q4 (Oct-Dec)'
                 END AS label,
-                DATEPART(QUARTER, time_occurred) AS period,
                 COUNT(*) AS count
-            FROM dbo.exception_logs
-            WHERE YEAR(time_occurred) = YEAR(GETDATE())
-            GROUP BY period, label
-            ORDER BY period
+            FROM dbo.exception_logs el
+            WHERE YEAR(el.time_occurred) = YEAR(GETDATE())
+            GROUP BY DATEPART(QUARTER, el.time_occurred)
+            ORDER BY DATEPART(QUARTER, el.time_occurred)
         """)
 
     elif time_range == "yearly":
         query = text("""
-            SELECT 
-                DATENAME(MONTH, time_occurred) AS label,
-                MONTH(time_occurred) AS period,
+            SELECT
+                DATENAME(MONTH, el.time_occurred) AS label,
+                MONTH(el.time_occurred) AS period,
                 COUNT(*) AS count
-            FROM dbo.exception_logs
-            WHERE YEAR(time_occurred) = YEAR(GETDATE())
-            GROUP BY period, label
-            ORDER BY period
+            FROM dbo.exception_logs el
+            WHERE YEAR(el.time_occurred) = YEAR(GETDATE())
+            GROUP BY MONTH(el.time_occurred), DATENAME(MONTH, el.time_occurred)
+            ORDER BY MONTH(el.time_occurred)
         """)
     else:
         raise HTTPException(
@@ -125,15 +151,19 @@ def fetch_logs_by_trend_analysis(
             label = current_date.strftime("%A")
 
             row = next(
-                (r for r in results if str(r["date_val"]) == str(current_date)),
-                None
+                (
+                    r
+                    for r in results
+                    if _row_to_date(r.get("date_val")) == current_date
+                ),
+                None,
             )
 
             data.append({
                 "label": f"{label} ({current_date})",
                 "day": label,
                 "date": str(current_date),
-                "count": int(row["count"]) if row else 0
+                "count": int(row["count"]) if row else 0,
             })
 
     elif time_range == "monthly":
@@ -141,41 +171,63 @@ def fetch_logs_by_trend_analysis(
         current_month = datetime.now().month
         _, last_day = calendar.monthrange(current_year, current_month)
 
-        weeks = sorted(set(
-            ((day - 1) // 7) + 1 for day in range(1, last_day + 1)
-        ))
+        weeks = sorted(
+            set(((day - 1) // 7) + 1 for day in range(1, last_day + 1))
+        )
 
         for week in weeks:
-            row = next((r for r in results if r["period"] == week), None)
+            row = next(
+                (r for r in results if _row_period_int(r.get("period")) == week),
+                None,
+            )
             data.append({
                 "label": f"Week {week}",
                 "week_number": week,
-                "count": int(row["count"]) if row else 0
+                "count": int(row["count"]) if row else 0,
             })
 
     elif time_range == "quarterly":
         for q in range(1, 5):
-            row = next((r for r in results if r["period"] == q), None)
+            row = next(
+                (r for r in results if _row_period_int(r.get("period")) == q),
+                None,
+            )
             data.append({
                 "label": row["label"] if row else f"Q{q}",
                 "quarter": q,
-                "count": int(row["count"]) if row else 0
+                "count": int(row["count"]) if row else 0,
             })
 
     elif time_range == "yearly":
         months = [
-            ("January", 1), ("February", 2), ("March", 3),
-            ("April", 4), ("May", 5), ("June", 6),
-            ("July", 7), ("August", 8), ("September", 9),
-            ("October", 10), ("November", 11), ("December", 12)
+            ("January", 1),
+            ("February", 2),
+            ("March", 3),
+            ("April", 4),
+            ("May", 5),
+            ("June", 6),
+            ("July", 7),
+            ("August", 8),
+            ("September", 9),
+            ("October", 10),
+            ("November", 11),
+            ("December", 12),
         ]
 
         for name, num in months:
-            row = next((r for r in results if r["period"] == num), None)
+            row = next(
+                (
+                    r
+                    for r in results
+                    if _row_period_int(r.get("period")) == num
+                ),
+                None,
+            )
+            lbl = decode_bytes(row["label"]) if row and row.get("label") is not None else name
             data.append({
-                "label": name,
+                "label": lbl,
                 "month": num,
-                "count": int(row["count"]) if row else 0
+                "count": int(row["count"]) if row else 0,
             })
 
     # ----------------------------

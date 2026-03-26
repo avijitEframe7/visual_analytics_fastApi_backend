@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 from app.database.database import get_db
 from app.models.users import User
+from app.models.roles import Role
 from app.models.user_page_permissions import UserPagePermission
 from app.schemas.auth import LoginRequest
 from app.security.rbac import (
@@ -14,6 +15,7 @@ from app.security.rbac import (
     require_authenticated,
     require_role,
     resolve_role_for_role_id,
+    seed_default_user_page_permissions,
 )
 from pydantic import BaseModel
 import hashlib
@@ -233,6 +235,127 @@ class ChangePasswordRequest(BaseModel):
     username: str
     currentPassword: str
     newPassword: str
+
+
+class AdminUserCreateRequest(BaseModel):
+    username: str
+    password: str
+    role_id: int
+
+
+class AdminUserUpdateRequest(BaseModel):
+    username: Optional[str] = None
+    password: Optional[str] = None
+    role_id: Optional[int] = None
+
+
+@router.get("/admin/roles")
+def admin_list_roles(
+    admin_auth: Dict = Depends(require_role("admin")),
+    db: Session = Depends(get_db),
+):
+    rows = db.query(Role).order_by(Role.role_id).all()
+    return [{"role_id": r.role_id, "role_name": r.role_name} for r in rows]
+
+
+@router.post("/admin/users")
+def admin_create_user(
+    data: AdminUserCreateRequest,
+    admin_auth: Dict = Depends(require_role("admin")),
+    db: Session = Depends(get_db),
+):
+    username = (data.username or "").strip()
+    if not username:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="username is required",
+        )
+    role = db.query(Role).filter(Role.role_id == data.role_id).first()
+    if not role:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid role_id",
+        )
+    existing = db.query(User).filter(User.username == username).first()
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Username already exists",
+        )
+    plain = data.password or ""
+    if not plain.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="password is required",
+        )
+    password_hashed = sha256_hash_with_encoding(plain.strip(), "utf-8").upper()
+    user = User(username=username, password=password_hashed, role_id=data.role_id)
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    seed_default_user_page_permissions(db)
+    return {
+        "success": True,
+        "user_id": user.user_id,
+        "username": user.username,
+        "role_id": user.role_id,
+    }
+
+
+@router.put("/admin/users/{user_id}")
+def admin_update_user(
+    user_id: int,
+    data: AdminUserUpdateRequest,
+    admin_auth: Dict = Depends(require_role("admin")),
+    db: Session = Depends(get_db),
+):
+    user = db.query(User).filter(User.user_id == user_id).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found",
+        )
+
+    if data.username is not None:
+        new_name = (data.username or "").strip()
+        if not new_name:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="username cannot be empty",
+            )
+        taken = (
+            db.query(User)
+            .filter(User.username == new_name, User.user_id != user_id)
+            .first()
+        )
+        if taken:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Username already exists",
+            )
+        user.username = new_name
+
+    if data.role_id is not None:
+        role = db.query(Role).filter(Role.role_id == data.role_id).first()
+        if not role:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid role_id",
+            )
+        user.role_id = data.role_id
+
+    if data.password is not None and str(data.password).strip():
+        plain = str(data.password).strip()
+        user.password = sha256_hash_with_encoding(plain, "utf-8").upper()
+
+    db.commit()
+    db.refresh(user)
+    return {
+        "success": True,
+        "user_id": user.user_id,
+        "username": user.username,
+        "role_id": user.role_id,
+    }
 
 
 @router.get("/admin/user-page-permissions")
