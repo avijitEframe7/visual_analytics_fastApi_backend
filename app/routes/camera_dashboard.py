@@ -97,6 +97,35 @@ USER_SELECTION_TO_VIOLATION: dict = {
 VIOLATION_CLASSES_FOR_LOG = frozenset(
     {"no_helmet", "no_vest", "no_goggles", "no_safetyshoes", "no_gloves"}
 )
+
+# Rules engine: violations only if a person is detected and the violation associates with a person box.
+# Person boxes below this confidence are ignored when gating violations.
+PERSON_MIN_CONF = 0.5
+# Minimum model score to treat a box as a violation (shoes/gloves: lower so faint detections still get spatial checks).
+VIOLATION_CLASS_MIN_CONF: dict[str, float] = {
+    "no_helmet": 0.45,
+    "no_vest": 0.45,
+    "no_goggles": 0.38,
+    "no_safetyshoes": 0.28,
+    "no_gloves": 0.18,
+}
+DEFAULT_VIOLATION_MIN_CONF = 0.40
+# Min association score vs some person box: max(intersection(V,P)/area(V), center(V) in P ? 1 : 0).
+# Lower for feet/hands where boxes sit on edges of the person bbox.
+VIOLATION_ASSOCIATION_MIN: dict[str, float] = {
+    "no_helmet": 0.45,
+    "no_vest": 0.45,
+    "no_goggles": 0.28,
+    "no_safetyshoes": 0.18,
+    "no_gloves": 0.10,
+}
+DEFAULT_VIOLATION_ASSOCIATION_MIN = 0.28
+
+# no_vest: stricter than max(overlap, center) — torso FPs often sit beside clutter with high "overlap" vs a loose person box.
+# Require bbox center inside a person box AND at least this fraction of the vest box area overlapping that person.
+NO_VEST_STRICT_CENTER_IN_PERSON = True
+NO_VEST_MIN_AREA_OVERLAP_WITH_PERSON = 0.55
+
 # YOLO emits short names; employeeinfo.exception_type uses longer labels (see SSMS seed rows).
 MODEL_NORMALIZED_TO_DB_EXCEPTION_NAME: dict[str, str] = {
     "no_vest": "no_safety_vest",
@@ -172,6 +201,117 @@ def _normalize_exception_name_for_db(s: str) -> str:
     while "__" in x:
         x = x.replace("__", "_")
     return x.strip("_")
+
+
+def _bbox_area_xyxy(xyxy) -> float:
+    x1, y1, x2, y2 = float(xyxy[0]), float(xyxy[1]), float(xyxy[2]), float(xyxy[3])
+    w = max(0.0, x2 - x1)
+    h = max(0.0, y2 - y1)
+    return w * h
+
+
+def _intersection_area_xyxy(a, b) -> float:
+    x1 = max(float(a[0]), float(b[0]))
+    y1 = max(float(a[1]), float(b[1]))
+    x2 = min(float(a[2]), float(b[2]))
+    y2 = min(float(a[3]), float(b[3]))
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    return (x2 - x1) * (y2 - y1)
+
+
+def _association_score_v_person(v_xyxy, p_xyxy) -> float:
+    """How well a violation box sits on a person: overlap fraction and/or center inside person."""
+    av = _bbox_area_xyxy(v_xyxy)
+    inter = _intersection_area_xyxy(v_xyxy, p_xyxy)
+    frac = (inter / av) if av > 1e-6 else 0.0
+    cx = (float(v_xyxy[0]) + float(v_xyxy[2])) * 0.5
+    cy = (float(v_xyxy[1]) + float(v_xyxy[3])) * 0.5
+    px1, py1, px2, py2 = float(p_xyxy[0]), float(p_xyxy[1]), float(p_xyxy[2]), float(p_xyxy[3])
+    center_in = 1.0 if (px1 <= cx <= px2 and py1 <= cy <= py2) else 0.0
+    return max(frac, center_in)
+
+
+def _best_violation_person_association(v_xyxy, person_boxes: List[np.ndarray]) -> float:
+    best = 0.0
+    for p in person_boxes:
+        best = max(best, _association_score_v_person(v_xyxy, p))
+    return best
+
+
+def _bbox_center_xy(v_xyxy) -> Tuple[float, float]:
+    return (
+        (float(v_xyxy[0]) + float(v_xyxy[2])) * 0.5,
+        (float(v_xyxy[1]) + float(v_xyxy[3])) * 0.5,
+    )
+
+
+def _point_inside_xyxy(px: float, py: float, xyxy) -> bool:
+    x1, y1, x2, y2 = float(xyxy[0]), float(xyxy[1]), float(xyxy[2]), float(xyxy[3])
+    return x1 <= px <= x2 and y1 <= py <= y2
+
+
+def _no_vest_strictly_on_person(v_xyxy, person_boxes: List[np.ndarray]) -> bool:
+    """
+    Vest violations must sit on a person: center of the vest box inside a person bbox and
+    most of the vest area overlapping that same person (reduces FPs beside equipment/walls).
+    """
+    av = _bbox_area_xyxy(v_xyxy)
+    if av <= 1e-6:
+        return False
+    cx, cy = _bbox_center_xy(v_xyxy)
+    need_frac = NO_VEST_MIN_AREA_OVERLAP_WITH_PERSON
+    for p in person_boxes:
+        if not _point_inside_xyxy(cx, cy, p):
+            continue
+        inter = _intersection_area_xyxy(v_xyxy, p)
+        if inter / av >= need_frac:
+            return True
+    return False
+
+
+def _person_boxes_from_frame(
+    xyxy_np: np.ndarray,
+    cls_np: np.ndarray,
+    conf_np: np.ndarray,
+    names: Any,
+) -> List[np.ndarray]:
+    """Collect person boxes above PERSON_MIN_CONF (normalized class name == person)."""
+    out: List[np.ndarray] = []
+    for i in range(len(cls_np)):
+        if float(conf_np[i]) < PERSON_MIN_CONF:
+            continue
+        cls_idx = int(cls_np[i])
+        raw = _raw_class_name_from_names(names, cls_idx)
+        norm = _normalize_exception_name_for_db(raw)
+        if norm != "person":
+            continue
+        out.append(xyxy_np[i])
+    return out
+
+
+def violation_passes_person_rules(
+    norm_name: str,
+    score: float,
+    v_xyxy: np.ndarray,
+    person_boxes: List[np.ndarray],
+) -> bool:
+    """
+    True if this box should count as an actionable PPE violation:
+    class is a violation, score meets per-class floor, at least one person exists,
+    and the box associates with a person bbox (overlap or center-in-person).
+    """
+    if norm_name not in VIOLATION_CLASSES_FOR_LOG:
+        return False
+    min_conf = VIOLATION_CLASS_MIN_CONF.get(norm_name, DEFAULT_VIOLATION_MIN_CONF)
+    if float(score) < min_conf:
+        return False
+    if not person_boxes:
+        return False
+    if norm_name == "no_vest" and NO_VEST_STRICT_CENTER_IN_PERSON:
+        return _no_vest_strictly_on_person(v_xyxy, person_boxes)
+    assoc_min = VIOLATION_ASSOCIATION_MIN.get(norm_name, DEFAULT_VIOLATION_ASSOCIATION_MIN)
+    return _best_violation_person_association(v_xyxy, person_boxes) >= assoc_min
 
 
 def _resolve_exception_type_id(db, exception_type: str) -> Optional[int]:
@@ -418,7 +558,7 @@ def generate_processed_frames2(video_path: str):
                 annotated_img = img
                 for r in results:
                     if r is not None:
-                        annotated_img = r.plot()
+                        annotated_img = _annotate_frame(img, r, filter_by_selected=False)
                         break
                 for r in results:
                     if r is None:
@@ -712,7 +852,7 @@ def generate_processed_frames4(video_path: str):
                     classes=detect_class_indices if detect_class_indices else None,
                     verbose=False,
                 )
-                annotated_frame = results[0].plot()
+                annotated_frame = _annotate_frame(frame, results[0], filter_by_selected=False)
                 annotated_frame = cv2.resize(annotated_frame, (640, 480))
                 _, buffer = cv2.imencode(
                     ".jpg", annotated_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80]
@@ -774,6 +914,7 @@ def _annotate_frame_for_exception(frame, result, exception_type: str):
     Draw only violation-class boxes on the frame so the emailed/exception image
     clearly shows what was violated. Violation boxes are drawn in RED with
     a 'VIOLATION: <type>' label so the receiver can understand from the photo.
+    Uses the same person + spatial + confidence rules as the live pipeline.
     """
     annotated = frame.copy() if frame is not None else frame
     if annotated is None or result is None:
@@ -783,13 +924,20 @@ def _annotate_frame_for_exception(frame, result, exception_type: str):
         return annotated
     xyxy = boxes.xyxy.cpu().numpy()
     confs = boxes.conf.cpu().numpy()
-    classes = boxes.cls.cpu().numpy().astype(int)
+    cls_np = boxes.cls.cpu().numpy()
+    classes = cls_np.astype(int)
     names = result.names if hasattr(result, "names") else getattr(model, "names", {})
+    want = _normalize_exception_name_for_db(exception_type)
+    person_boxes = _person_boxes_from_frame(xyxy, cls_np, confs, names)
     for (x1, y1, x2, y2), conf, cls_id in zip(xyxy, confs, classes):
         cls_idx = int(cls_id)
         raw = names.get(cls_idx, str(cls_idx)) if isinstance(names, dict) else (names[cls_idx] if cls_idx < len(names) else str(cls_idx))
-        norm_name = (raw or "").strip().lower().replace(" ", "_")
+        norm_name = _normalize_exception_name_for_db(raw)
         if norm_name not in VIOLATION_CLASSES_FOR_LOG:
+            continue
+        if norm_name != want:
+            continue
+        if not violation_passes_person_rules(norm_name, float(conf), np.asarray([x1, y1, x2, y2], dtype=np.float32), person_boxes):
             continue
         x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
         label = f"VIOLATION: {norm_name} ({conf:.2f})"
@@ -806,6 +954,9 @@ def _annotate_frame(frame, result, filter_by_selected=True):
     Draw detection boxes on frame. Uses result from DISPLAY queue (full YOLO result with .boxes).
     When filter_by_selected=True, only draws classes in selected_class_names (from start_live_detection).
     Uses flexible matching so model names (e.g. vest, safety_shoes) match frontend ids (safety_vest, shoes).
+    Person boxes below PERSON_MIN_CONF are not drawn (avoids labeling clutter as Person 0.26, etc.).
+    PPE violation classes (no_helmet, no_vest, …) are drawn only when violation_passes_person_rules
+    is true — same rules engine as the live JSON / exception pipeline.
     """
     annotated = frame.copy()
     if result is None:
@@ -815,16 +966,30 @@ def _annotate_frame(frame, result, filter_by_selected=True):
         return annotated
     xyxy = boxes.xyxy.cpu().numpy()
     confs = boxes.conf.cpu().numpy()
-    classes = boxes.cls.cpu().numpy().astype(int)
+    cls_np = boxes.cls.cpu().numpy()
+    classes = cls_np.astype(int)
     names = result.names if hasattr(result, "names") else getattr(model, "names", {})
+    person_boxes = _person_boxes_from_frame(xyxy, cls_np, confs, names)
     for (x1, y1, x2, y2), conf, cls_id in zip(xyxy, confs, classes):
+        cls_idx = int(cls_id)
+        raw = names.get(cls_idx, str(cls_idx)) if isinstance(names, dict) else (names[cls_idx] if cls_idx < len(names) else str(cls_idx))
+        norm = _normalize_exception_name_for_db(raw)
+        if norm == "person" and float(conf) < PERSON_MIN_CONF:
+            continue
+        if norm in VIOLATION_CLASSES_FOR_LOG:
+            if not violation_passes_person_rules(
+                norm,
+                float(conf),
+                np.asarray([x1, y1, x2, y2], dtype=np.float32),
+                person_boxes,
+            ):
+                continue
         if filter_by_selected and selected_class_names:
-            raw = names.get(cls_id, str(cls_id)) if isinstance(names, dict) else (names[cls_id] if cls_id < len(names) else str(cls_id))
             cls_name = (raw or "").strip()
             if not _class_matches_selected(cls_name):
                 continue
         x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
-        label = f"{names.get(cls_id, str(cls_id))} {conf:.2f}" if isinstance(names, dict) else f"{cls_id} {conf:.2f}"
+        label = f"{raw} {conf:.2f}"
         cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
         cv2.rectangle(annotated, (x1, y1 - th - 4), (x1 + tw, y1), (0, 255, 0), -1)
@@ -947,12 +1112,14 @@ def yolo_batch_worker():
                         idx = 0 if nq == 1 else min(cam_id, nq - 1)
                         disp = {"camera_id": cam_id, "frame": frame_copy, "result": res}
                         boxes = res.boxes
+                        person_boxes: List[np.ndarray] = []
                         # Realtime detection JSON: enqueue per-frame detection summary (all classes)
                         if boxes is not None and len(boxes) > 0:
                             names = res.names if hasattr(res, "names") else getattr(model, "names", {})
                             xyxy_np = boxes.xyxy.cpu().numpy()
                             cls_np = boxes.cls.cpu().numpy()
                             conf_np = boxes.conf.cpu().numpy()
+                            person_boxes = _person_boxes_from_frame(xyxy_np, cls_np, conf_np, names)
                             detections_json = []
                             timestamp = datetime.utcnow().isoformat()
                             for (x1, y1, x2, y2), cls_id, score in zip(xyxy_np, cls_np, conf_np):
@@ -961,8 +1128,13 @@ def yolo_batch_worker():
                                     raw_name = names.get(cls_idx, str(cls_idx))
                                 else:
                                     raw_name = names[cls_idx] if 0 <= cls_idx < len(names) else str(cls_idx)
-                                norm_name = (raw_name or "").strip().lower().replace(" ", "_")
-                                is_violation = norm_name in VIOLATION_CLASSES_FOR_LOG
+                                norm_name = _normalize_exception_name_for_db(raw_name)
+                                is_violation = violation_passes_person_rules(
+                                    norm_name,
+                                    float(score),
+                                    np.asarray([x1, y1, x2, y2], dtype=np.float32),
+                                    person_boxes,
+                                )
                                 detections_json.append(
                                     {
                                         "class_id": cls_idx,
@@ -973,7 +1145,7 @@ def yolo_batch_worker():
                                         "is_violation": is_violation,
                                     }
                                 )
-                                # Append to plain-text log only for violation classes (no_helmet, no_vest, no_goggles, no_safetyshoes)
+                                # Append to plain-text log only for actionable violations (person + spatial + conf rules)
                                 if is_violation:
                                     try:
                                         os.makedirs(MEDIA_ROOT, exist_ok=True)
@@ -1013,7 +1185,7 @@ def yolo_batch_worker():
                                             detection_frames_queue.put_nowait((frame_copy.copy(), res, event, cam_id))
                                         except queue.Empty:
                                             pass
-                        if len(boxes) > 0 and idx < len(pipeline_output_queues):
+                        if boxes is not None and len(boxes) > 0 and idx < len(pipeline_output_queues):
                             out_q = pipeline_output_queues[idx]
                             names = res.names if hasattr(res, "names") else getattr(model, "names", {})
                             xyxy_np = boxes.xyxy.cpu().numpy()
@@ -1062,15 +1234,25 @@ def yolo_batch_worker():
                                 except queue.Empty:
                                     pass
                         # Exception log: enqueue violations for DB insert (throttled, non-blocking)
-                        if len(boxes) > 0:
+                        if boxes is not None and len(boxes) > 0:
                             names = res.names if hasattr(res, "names") else getattr(model, "names", {})
+                            xyxy_np = boxes.xyxy.cpu().numpy()
                             cls_np = boxes.cls.cpu().numpy()
+                            conf_np = boxes.conf.cpu().numpy()
                             seen_violations = set()
-                            for c in cls_np:
-                                raw = _raw_class_name_from_names(names, int(c))
+                            for i in range(len(cls_np)):
+                                raw = _raw_class_name_from_names(names, int(cls_np[i]))
                                 name = _normalize_exception_name_for_db(raw)
-                                if name in VIOLATION_CLASSES_FOR_LOG:
-                                    seen_violations.add(name)
+                                if name not in VIOLATION_CLASSES_FOR_LOG:
+                                    continue
+                                if not violation_passes_person_rules(
+                                    name,
+                                    float(conf_np[i]),
+                                    xyxy_np[i],
+                                    person_boxes,
+                                ):
+                                    continue
+                                seen_violations.add(name)
                             if seen_violations:
                                 now = time.time()
                                 time_occurred = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
