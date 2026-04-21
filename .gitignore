@@ -1,23 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+
+# Env
 .venv/
-logs/*
-__pycache__/*
-app/routes/__pycache__/*
-app/models/__pycache__/*
-app/utils/__pycache__/*
-app/schemas/__pycache__/*
-app/schemas/__pycache__/*
-app/database/__pycache__/*
-app/security/__pycache__/*
-app/routes/__pycache__/*
-app/utils/__pycache__/*
-app/schemas/__pycache__/*
-app/database/__pycache__/*
-app/security/__pycache__/*
-app/routes/__pycache__/*
-app/utils/__pycache__/*
-app/schemas/__pycache__/*
-app/database/__pycache__/*
-app/security/__pycache__/*
-app/routes/__pycache__/*
-app/utils/__pycache__/*
-app/schemas/__pycache__/*
+.env
+
+# Logs
+logs/
+
+# Media
+media/
+
+# ML
+ML_models/
+
+# Testing
+testing/
