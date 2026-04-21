@@ -18,9 +18,9 @@ DB_NAME = os.getenv("DB_NAME")
 # Default 3306 if DB_PORT not set in .env
 DB_PORT = os.getenv("DB_PORT", "3306")
 
-# SQLAlchemy connection string: driver://user:password@host:port/database
+# mysqlconnector implements caching_sha2_password without PyMySQL's cryptography dependency.
 DATABASE_URL = (
-    f"mysql+pymysql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+    f"mysql+mysqlconnector://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 )
 
 # Single shared engine; pool_pre_ping checks connections before use (auto reconnect)
@@ -28,7 +28,7 @@ engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,   # auto reconnect
     pool_size=10,         # keep up to 10 connections in the pool
-    max_overflow=20       # allow 20 extra connections under load
+    max_overflow=20,      # allow 20 extra connections under load
 )
 
 # Factory for per-request sessions: no auto-commit/flush so we control transactions
