@@ -443,6 +443,39 @@ model = None
 DEVICE = "cuda:0"
 
 
+def _tensorrt_python_available() -> bool:
+    try:
+        import tensorrt  # noqa: F401
+        return True
+    except ModuleNotFoundError:
+        return False
+
+
+def _resolve_yolo_weights_path(preferred: str) -> str:
+    """
+    Prefer the configured path. For .engine, require the tensorrt Python package;
+    if it is missing, use a same-stem .pt next to the .engine when present.
+    """
+    preferred = os.path.abspath(preferred)
+    if not preferred.lower().endswith(".engine"):
+        return preferred
+    if _tensorrt_python_available():
+        return preferred
+    stem, _ = os.path.splitext(preferred)
+    pt_path = stem + ".pt"
+    if os.path.isfile(pt_path):
+        print(
+            "[camera_dashboard] TensorRT Python module not found; "
+            f"using PyTorch weights: {os.path.basename(pt_path)}"
+        )
+        return pt_path
+    print(
+        "[camera_dashboard] ERROR: .engine requires `tensorrt` (pip install tensorrt) "
+        f"or a sibling .pt file; missing: {os.path.basename(pt_path)}"
+    )
+    sys.exit(1)
+
+
 def _ensure_model_loaded():
     """Load YOLO once when pipeline starts; requires GPU."""
     global model
@@ -453,11 +486,12 @@ def _ensure_model_loaded():
         sys.exit(1)
     torch.cuda.set_device(0)
     gpu_name = torch.cuda.get_device_name(0)
-    model = YOLO(MODEL_PATH)
-    if MODEL_PATH.lower().endswith(".pt"):
+    weights_path = _resolve_yolo_weights_path(MODEL_PATH)
+    model = YOLO(weights_path)
+    if weights_path.lower().endswith(".pt"):
         model.to(DEVICE)
         model.model.half()
-    if MODEL_PATH.lower().endswith(".engine"):
+    if weights_path.lower().endswith(".engine"):
         try:
             model(np.zeros((640, 640, 3), dtype=np.uint8), device=DEVICE, verbose=False)
         except Exception as e:
@@ -465,7 +499,7 @@ def _ensure_model_loaded():
                 print("[camera_dashboard] TensorRT DLL not found. Add TensorRT bin to PATH or use .pt model.")
                 sys.exit(1)
             raise
-    print(f"[camera_dashboard] GPU: {gpu_name} | Model: {os.path.basename(MODEL_PATH)}")
+    print(f"[camera_dashboard] GPU: {gpu_name} | Model: {os.path.basename(weights_path)}")
 
 
 # -----------------------------------------------------------------------------
