@@ -1,5 +1,7 @@
 import asyncio
 import json
+import logging
+import math
 import os
 import queue
 import re
@@ -8,11 +10,12 @@ import threading
 import time
 from datetime import datetime
 from typing import Any, List, Optional, Set, Tuple
+from urllib.parse import quote, unquote
 
 import cv2
 import numpy as np
 import torch
-from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import text
@@ -21,7 +24,11 @@ from ultralytics import YOLO
 from app.database.database import SessionLocal
 from app.routes.camera_config import get_camera_config, get_rtsp_urls
 from app.routes.email_feature import enqueue_violation_email
-from app.security.rbac import decode_access_token, get_role_allowed_page_keys, require_permission
+from app.security.rbac import (
+    decode_access_token,
+    get_user_allowed_page_keys,
+    require_permission,
+)
 
 # Add TensorRT DLL search paths before any TensorRT/Ultralytics use (fixes nvinfer_10.dll not found)
 _script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -85,8 +92,45 @@ USER_SELECTION_TO_VIOLATION: dict = {
     "safety_shoes": ["no_safetyshoes"],
 }
 
-# Exception log: violations to insert into employeeinfo.exception_logs (notification feed)
-VIOLATION_CLASSES_FOR_LOG = frozenset({"no_helmet", "no_vest", "no_goggles", "no_safetyshoes"})
+# Exception log: violations to insert into exception_logs (notification feed)
+# Model training names (normalized) vs exception_type.exception_name — map below when they differ.
+VIOLATION_CLASSES_FOR_LOG = frozenset(
+    {"no_helmet", "no_vest", "no_goggles", "no_safetyshoes", "no_gloves"}
+)
+
+# Rules engine: violations only if a person is detected and the violation associates with a person box.
+# Person boxes below this confidence are ignored when gating violations.
+PERSON_MIN_CONF = 0.5
+# Minimum model score to treat a box as a violation (shoes/gloves: lower so faint detections still get spatial checks).
+VIOLATION_CLASS_MIN_CONF: dict[str, float] = {
+    "no_helmet": 0.45,
+    "no_vest": 0.45,
+    "no_goggles": 0.38,
+    "no_safetyshoes": 0.28,
+    "no_gloves": 0.18,
+}
+DEFAULT_VIOLATION_MIN_CONF = 0.40
+# Min association score vs some person box: max(intersection(V,P)/area(V), center(V) in P ? 1 : 0).
+# Lower for feet/hands where boxes sit on edges of the person bbox.
+VIOLATION_ASSOCIATION_MIN: dict[str, float] = {
+    "no_helmet": 0.45,
+    "no_vest": 0.45,
+    "no_goggles": 0.28,
+    "no_safetyshoes": 0.18,
+    "no_gloves": 0.10,
+}
+DEFAULT_VIOLATION_ASSOCIATION_MIN = 0.28
+
+# no_vest: stricter than max(overlap, center) — torso FPs often sit beside clutter with high "overlap" vs a loose person box.
+# Require bbox center inside a person box AND at least this fraction of the vest box area overlapping that person.
+NO_VEST_STRICT_CENTER_IN_PERSON = True
+NO_VEST_MIN_AREA_OVERLAP_WITH_PERSON = 0.55
+
+# YOLO emits short names; employeeinfo.exception_type uses longer labels (see SSMS seed rows).
+MODEL_NORMALIZED_TO_DB_EXCEPTION_NAME: dict[str, str] = {
+    "no_vest": "no_safety_vest",
+    "no_safetyshoes": "no_safety_shoes",
+}
 EXCEPTION_LOG_THROTTLE_SECONDS = 180
 EXCEPTION_LOG_QUEUE_SIZE = 32
 exception_log_queue: queue.Queue = queue.Queue(maxsize=EXCEPTION_LOG_QUEUE_SIZE)
@@ -109,6 +153,201 @@ MEDIA_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(os.pat
 EXCEPTION_LOGS_DIR = os.path.abspath(os.path.join(MEDIA_ROOT, "exception_logs"))
 DETECTION_FRAMES_DIR = os.path.abspath(os.path.join(MEDIA_ROOT, "detection_frames"))
 DETECTION_LOG_FILE = os.path.abspath(os.path.join(MEDIA_ROOT, "logs.txt"))
+EXCEPTION_PIPELINE_LOG_PATH = os.path.abspath(os.path.join(MEDIA_ROOT, "exception_pipeline.log"))
+
+# Uploaded file analysis (demo2/3/4): stored under media/uploads
+UPLOAD_FOLDER = os.path.abspath(os.path.join(MEDIA_ROOT, "uploads"))
+ALLOWED_UPLOAD_EXTENSIONS = frozenset({"mp4", "avi", "mov", "mkv", "jpg", "jpeg", "png"})
+
+_exception_pipeline_logger: Optional[logging.Logger] = None
+
+
+def _log_exception_pipeline(msg: str) -> None:
+    """Print to stdout and append to media/exception_pipeline.log (survives headless / service runs)."""
+    global _exception_pipeline_logger
+    print(f"[camera_dashboard] {msg}")
+    try:
+        os.makedirs(MEDIA_ROOT, exist_ok=True)
+        if _exception_pipeline_logger is None:
+            lg = logging.getLogger("camera_dashboard.exception_pipeline")
+            lg.setLevel(logging.INFO)
+            lg.handlers.clear()
+            fh = logging.FileHandler(EXCEPTION_PIPELINE_LOG_PATH, encoding="utf-8")
+            fh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+            lg.addHandler(fh)
+            lg.propagate = False
+            _exception_pipeline_logger = lg
+        _exception_pipeline_logger.info(msg)
+    except Exception as e:
+        print(f"[camera_dashboard] exception_log: failed to write exception_pipeline.log: {e}")
+
+
+def _raw_class_name_from_names(names: Any, cls_idx: int) -> str:
+    """Ultralytics may expose class names as dict (id -> str) or list; avoid .get on lists."""
+    ci = int(cls_idx)
+    if isinstance(names, dict):
+        return str(names.get(ci, str(ci)))
+    try:
+        if 0 <= ci < len(names):
+            return str(names[ci])
+    except (TypeError, IndexError, KeyError):
+        pass
+    return str(ci)
+
+
+def _normalize_exception_name_for_db(s: str) -> str:
+    """Match model output (e.g. no_helmet) to exception_type.exception_name (may be NO_helmet, 'No Helmet', etc.)."""
+    x = (s or "").strip().lower().replace(" ", "_").replace("-", "_")
+    while "__" in x:
+        x = x.replace("__", "_")
+    return x.strip("_")
+
+
+def _bbox_area_xyxy(xyxy) -> float:
+    x1, y1, x2, y2 = float(xyxy[0]), float(xyxy[1]), float(xyxy[2]), float(xyxy[3])
+    w = max(0.0, x2 - x1)
+    h = max(0.0, y2 - y1)
+    return w * h
+
+
+def _intersection_area_xyxy(a, b) -> float:
+    x1 = max(float(a[0]), float(b[0]))
+    y1 = max(float(a[1]), float(b[1]))
+    x2 = min(float(a[2]), float(b[2]))
+    y2 = min(float(a[3]), float(b[3]))
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    return (x2 - x1) * (y2 - y1)
+
+
+def _association_score_v_person(v_xyxy, p_xyxy) -> float:
+    """How well a violation box sits on a person: overlap fraction and/or center inside person."""
+    av = _bbox_area_xyxy(v_xyxy)
+    inter = _intersection_area_xyxy(v_xyxy, p_xyxy)
+    frac = (inter / av) if av > 1e-6 else 0.0
+    cx = (float(v_xyxy[0]) + float(v_xyxy[2])) * 0.5
+    cy = (float(v_xyxy[1]) + float(v_xyxy[3])) * 0.5
+    px1, py1, px2, py2 = float(p_xyxy[0]), float(p_xyxy[1]), float(p_xyxy[2]), float(p_xyxy[3])
+    center_in = 1.0 if (px1 <= cx <= px2 and py1 <= cy <= py2) else 0.0
+    return max(frac, center_in)
+
+
+def _best_violation_person_association(v_xyxy, person_boxes: List[np.ndarray]) -> float:
+    best = 0.0
+    for p in person_boxes:
+        best = max(best, _association_score_v_person(v_xyxy, p))
+    return best
+
+
+def _bbox_center_xy(v_xyxy) -> Tuple[float, float]:
+    return (
+        (float(v_xyxy[0]) + float(v_xyxy[2])) * 0.5,
+        (float(v_xyxy[1]) + float(v_xyxy[3])) * 0.5,
+    )
+
+
+def _point_inside_xyxy(px: float, py: float, xyxy) -> bool:
+    x1, y1, x2, y2 = float(xyxy[0]), float(xyxy[1]), float(xyxy[2]), float(xyxy[3])
+    return x1 <= px <= x2 and y1 <= py <= y2
+
+
+def _no_vest_strictly_on_person(v_xyxy, person_boxes: List[np.ndarray]) -> bool:
+    """
+    Vest violations must sit on a person: center of the vest box inside a person bbox and
+    most of the vest area overlapping that same person (reduces FPs beside equipment/walls).
+    """
+    av = _bbox_area_xyxy(v_xyxy)
+    if av <= 1e-6:
+        return False
+    cx, cy = _bbox_center_xy(v_xyxy)
+    need_frac = NO_VEST_MIN_AREA_OVERLAP_WITH_PERSON
+    for p in person_boxes:
+        if not _point_inside_xyxy(cx, cy, p):
+            continue
+        inter = _intersection_area_xyxy(v_xyxy, p)
+        if inter / av >= need_frac:
+            return True
+    return False
+
+
+def _person_boxes_from_frame(
+    xyxy_np: np.ndarray,
+    cls_np: np.ndarray,
+    conf_np: np.ndarray,
+    names: Any,
+) -> List[np.ndarray]:
+    """Collect person boxes above PERSON_MIN_CONF (normalized class name == person)."""
+    out: List[np.ndarray] = []
+    for i in range(len(cls_np)):
+        if float(conf_np[i]) < PERSON_MIN_CONF:
+            continue
+        cls_idx = int(cls_np[i])
+        raw = _raw_class_name_from_names(names, cls_idx)
+        norm = _normalize_exception_name_for_db(raw)
+        if norm != "person":
+            continue
+        out.append(xyxy_np[i])
+    return out
+
+
+def violation_passes_person_rules(
+    norm_name: str,
+    score: float,
+    v_xyxy: np.ndarray,
+    person_boxes: List[np.ndarray],
+) -> bool:
+    """
+    True if this box should count as an actionable PPE violation:
+    class is a violation, score meets per-class floor, at least one person exists,
+    and the box associates with a person bbox (overlap or center-in-person).
+    """
+    if norm_name not in VIOLATION_CLASSES_FOR_LOG:
+        return False
+    min_conf = VIOLATION_CLASS_MIN_CONF.get(norm_name, DEFAULT_VIOLATION_MIN_CONF)
+    if float(score) < min_conf:
+        return False
+    if not person_boxes:
+        return False
+    if norm_name == "no_vest" and NO_VEST_STRICT_CENTER_IN_PERSON:
+        return _no_vest_strictly_on_person(v_xyxy, person_boxes)
+    assoc_min = VIOLATION_ASSOCIATION_MIN.get(norm_name, DEFAULT_VIOLATION_ASSOCIATION_MIN)
+    return _best_violation_person_association(v_xyxy, person_boxes) >= assoc_min
+
+
+def _resolve_exception_type_id(db, exception_type: str) -> Optional[int]:
+    """
+    Resolve FK for exception_logs. Exact equality on exception_name often fails when the DB
+    uses different casing or spacing than the normalized YOLO class name.
+    Also maps model names to exception_type rows (e.g. no_vest -> no_safety_vest).
+    """
+    norm = _normalize_exception_name_for_db(exception_type)
+    db_label = MODEL_NORMALIZED_TO_DB_EXCEPTION_NAME.get(norm, norm)
+    sql_norm = _normalize_exception_name_for_db(db_label)
+    row = db.execute(
+        text(
+            """
+            SELECT et.exception_type_id
+            FROM exception_type et
+            WHERE LOWER(REPLACE(REPLACE(TRIM(et.exception_name), ' ', '_'), '-', '_')) = :norm
+            LIMIT 1
+            """
+        ),
+        {"norm": sql_norm},
+    ).scalar()
+    if row is not None:
+        return int(row)
+    rows = db.execute(
+        text(
+            "SELECT exception_type_id, exception_name FROM exception_type ORDER BY exception_type_id"
+        )
+    ).fetchall()
+    _log_exception_pipeline(
+        f"exception_log: no exception_type_id for model class {exception_type!r} "
+        f"(normalized={norm!r}, db_lookup={sql_norm!r}). Check exception_type.exception_name. "
+        f"Current rows: {rows}"
+    )
+    return None
+
 
 # Counters for debugging (YOLO worker)
 _debug_frames_with_detections = 0
@@ -118,8 +357,66 @@ _debug_lock = threading.Lock()
 # Stop signal for live detection pipeline
 pipeline_stop_event = threading.Event()
 
+# File upload / recorded video analysis (demo2, demo3, demo4)
+video_processing_active = False
+current_processing_type: Optional[str] = None
+current_processing_video_path: Optional[str] = None
+video_processing_stop_requested = False
+file_analysis_selected_classes: List[str] = []
+
 # Ordered camera ids for current pipeline (index = display queue index)
 current_camera_ids: List[str] = []
+
+
+def _pipeline_index_to_db_camera_id(cam_index) -> int:
+    """
+    RTSP/YOLO threads tag frames with a stream index (0..n-1). camera uses the real PK
+    (see current_camera_ids from start_live_detection). Storing the index as camera_id breaks
+    JOINs to camera; map index -> actual camera_id for exception_logs and email.
+    """
+    global current_camera_ids
+    try:
+        idx = int(cam_index)
+    except (TypeError, ValueError):
+        idx = 0
+    if 0 <= idx < len(current_camera_ids):
+        raw = str(current_camera_ids[idx]).strip()
+        if raw.isdigit():
+            return int(raw)
+    return idx
+
+
+def _db_str_cell(val) -> Optional[str]:
+    if val is None:
+        return None
+    if isinstance(val, bytes):
+        try:
+            return val.decode("utf-8").strip() or None
+        except UnicodeDecodeError:
+            return None
+    s = str(val).strip()
+    return s or None
+
+
+def _camera_name_zone_from_db(db, camera_id: int) -> Tuple[Optional[str], Optional[str]]:
+    """Load camera_name and zone_name from camera for emails (same source as SSMS)."""
+    row = db.execute(
+        text(
+            """
+            SELECT
+                camera_name,
+                zone_name
+            FROM camera
+            WHERE camera_id = :cid
+            LIMIT 1
+            """
+        ),
+        {"cid": camera_id},
+    ).mappings().first()
+    if not row:
+        return None, None
+    m = {k.lower(): v for k, v in dict(row).items()}
+    return _db_str_cell(m.get("camera_name")), _db_str_cell(m.get("zone_name"))
 
 
 def _ensure_detection_log_file():
@@ -170,6 +467,419 @@ def _ensure_model_loaded():
 
 
 # -----------------------------------------------------------------------------
+# File upload analysis: helpers + MJPEG generators (demo2 / demo3 / demo4)
+# -----------------------------------------------------------------------------
+def _allowed_upload_file(filename: Optional[str]) -> bool:
+    if not filename or "." not in filename:
+        return False
+    ext = filename.rsplit(".", 1)[1].lower()
+    return ext in ALLOWED_UPLOAD_EXTENSIONS
+
+
+def _secure_upload_filename(filename: str) -> str:
+    base = os.path.basename(filename).replace("..", "")
+    cleaned = re.sub(r"[^a-zA-Z0-9._-]", "_", base)
+    return cleaned or "upload.bin"
+
+
+def _safe_path_under_upload(video_path: str) -> Optional[str]:
+    """Reject path traversal; only files under UPLOAD_FOLDER."""
+    if not video_path:
+        return None
+    try:
+        decoded = unquote(video_path)
+        abs_path = os.path.abspath(decoded)
+        root = os.path.abspath(UPLOAD_FOLDER)
+        if not abs_path.startswith(root + os.sep) and abs_path != root:
+            return None
+        if not os.path.isfile(abs_path):
+            return None
+        return abs_path
+    except Exception:
+        return None
+
+
+def _file_analysis_frame_period_sec(cap: cv2.VideoCapture) -> float:
+    """Target seconds between frames to match the source file's nominal FPS (playback speed)."""
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    if fps <= 1.0 or fps > 120.0:
+        fps = 25.0
+    return 1.0 / fps
+
+
+def _file_analysis_pace_realtime(period_sec: float, loop_start: float) -> None:
+    """Sleep so wall time since loop_start reaches one frame period (original playback speed)."""
+    elapsed = time.perf_counter() - loop_start
+    rem = period_sec - elapsed
+    if rem > 0:
+        time.sleep(rem)
+
+
+def _yolo_all_class_indices() -> List[int]:
+    _ensure_model_loaded()
+    names = model.names
+    if isinstance(names, dict):
+        return list(names.keys())
+    return list(range(len(names)))
+
+
+def generate_processed_frames2(video_path: str):
+    """YOLO-processed MJPEG stream from a video file (general detection)."""
+    global video_processing_stop_requested, model
+    global video_processing_active, current_processing_video_path, current_processing_type
+    _ensure_model_loaded()
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        video_processing_active = False
+        current_processing_video_path = None
+        current_processing_type = None
+        return
+    frame_period = _file_analysis_frame_period_sec(cap)
+    frame_counter = 0
+    try:
+        while True:
+            loop_t0 = time.perf_counter()
+            if video_processing_stop_requested:
+                break
+            success, img = cap.read()
+            if not success:
+                break
+            frame_counter += 1
+            if img is None or img.size == 0:
+                continue
+            curr_datetime = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            try:
+                all_class_indices = _yolo_all_class_indices()
+                results = model.predict(
+                    img, conf=0.25, iou=0.45, classes=all_class_indices, verbose=False
+                )
+            except Exception as yolo_error:
+                print(f"[file_analysis] YOLO error frame {frame_counter}: {yolo_error}")
+                continue
+            try:
+                annotated_img = img
+                for r in results:
+                    if r is not None:
+                        annotated_img = _annotate_frame(img, r, filter_by_selected=False)
+                        break
+                for r in results:
+                    if r is None:
+                        continue
+                    boxes = r.boxes
+                    if boxes is None:
+                        break
+                    for box in boxes:
+                        conf = math.ceil((box.conf[0] * 100)) / 100
+                        cls = int(box.cls[0])
+                        raw = model.names.get(cls, str(cls)) if isinstance(model.names, dict) else (
+                            model.names[cls] if cls < len(model.names) else str(cls)
+                        )
+                        current_class = str(raw)
+                        violation_classes = [
+                            "NO_helmet",
+                            "NO_Vest",
+                            "NO_goggles",
+                            "NO_SafetyShoes",
+                            "NO_Gloves",
+                        ]
+                        is_violation = current_class in violation_classes
+                        if conf > 0.5 and is_violation:
+                            try:
+                                face_dir = os.path.join(MEDIA_ROOT, "face_detect")
+                                os.makedirs(face_dir, exist_ok=True)
+                                cv2.imwrite(
+                                    os.path.join(face_dir, f"output{curr_datetime}.jpg"),
+                                    annotated_img,
+                                )
+                                cv2.imwrite(os.path.join(face_dir, "output.jpg"), annotated_img)
+                            except Exception as write_error:
+                                print(f"[file_analysis] save violation image: {write_error}")
+                    break
+                img = annotated_img
+            except Exception as results_error:
+                print(f"[file_analysis] results error frame {frame_counter}: {results_error}")
+                continue
+            img = cv2.resize(img, (640, 480))
+            if img is None or img.size == 0:
+                continue
+            ok, buffer = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            if not ok or buffer is None:
+                continue
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
+            )
+            _file_analysis_pace_realtime(frame_period, loop_t0)
+    except Exception as e:
+        print(f"[file_analysis] stream error: {e}")
+    finally:
+        cap.release()
+        video_processing_stop_requested = False
+        video_processing_active = False
+        current_processing_video_path = None
+        current_processing_type = None
+
+
+def generate_processed_frames3(video_path: str):
+    """Zone-based PPE MJPEG stream (vertical divider)."""
+    global video_processing_stop_requested, model
+    global video_processing_active, current_processing_video_path, current_processing_type
+    _ensure_model_loaded()
+    CONF_THRES = 0.25
+    IOU_THRES = 0.45
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        video_processing_active = False
+        current_processing_video_path = None
+        current_processing_type = None
+        return
+    frame_period = _file_analysis_frame_period_sec(cap)
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    x_mid = W // 2
+    divider = [x_mid, 0, x_mid, H - 1]
+    zone_names = ("LEFT", "RIGHT")
+    x1, y1, x2, y2 = divider
+    CLR_LINE = (255, 255, 255)
+
+    def point_side_of_line(px, py, ax1, ay1, ax2, ay2):
+        return (ax2 - ax1) * (py - ay1) - (ay2 - ay1) * (px - ax1)
+
+    def draw_label(img, text, x, y, color=(255, 255, 255), bg=(0, 0, 0)):
+        (tw, th), base = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        cv2.rectangle(img, (x, y - th - 6), (x + tw + 6, y + 2), bg, -1)
+        cv2.putText(img, text, (x + 3, y - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+
+    try:
+        while True:
+            loop_t0 = time.perf_counter()
+            if video_processing_stop_requested:
+                break
+            success, frame = cap.read()
+            if not success:
+                break
+            results = model.predict(frame, conf=CONF_THRES, iou=IOU_THRES, verbose=False)
+            annotated = frame.copy()
+            dets = results[0].boxes
+            names = model.names
+            if dets is not None and len(dets) > 0:
+                for i in range(len(dets)):
+                    xyxy = dets.xyxy[i].cpu().tolist()
+                    cls = int(dets.cls[i].cpu().item())
+                    conf = float(dets.conf[i].cpu().item())
+                    if isinstance(names, dict):
+                        class_name = str(names.get(cls, str(cls)))
+                    else:
+                        class_name = str(names[cls]) if cls < len(names) else str(cls)
+                    px1, py1, px2, py2 = [int(c) for c in xyxy]
+                    if class_name.lower() == "person":
+                        pcx, pcy = (px1 + px2) / 2, (py1 + py2) / 2
+                        sign = point_side_of_line(pcx, pcy, x1, y1, x2, y2)
+                        zone = zone_names[0] if sign > 0 else zone_names[1] if sign < 0 else "ON_LINE"
+                        if zone == zone_names[1]:
+                            cv2.rectangle(annotated, (px1, py1), (px2, py2), (0, 255, 0), 2)
+                            draw_label(annotated, "OK", px1, py1 - 10, color=(255, 255, 255), bg=(0, 255, 0))
+                        else:
+                            cv2.rectangle(annotated, (px1, py1), (px2, py2), (0, 255, 0), 2)
+                            cv2.putText(
+                                annotated,
+                                f"{class_name} {conf:.2f}",
+                                (px1, py1 - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.5,
+                                (0, 255, 0),
+                                2,
+                            )
+                            draw_label(
+                                annotated,
+                                f"Zone: {zone}",
+                                px1,
+                                py1 - 30,
+                                color=(255, 255, 255),
+                                bg=(0, 0, 255),
+                            )
+                    else:
+                        dcx, dcy = (px1 + px2) / 2, (py1 + py2) / 2
+                        sign = point_side_of_line(dcx, dcy, x1, y1, x2, y2)
+                        zone = zone_names[0] if sign > 0 else zone_names[1] if sign < 0 else "ON_LINE"
+                        if zone == zone_names[0] or sign == 0:
+                            cv2.rectangle(annotated, (px1, py1), (px2, py2), (0, 255, 0), 2)
+                            cv2.putText(
+                                annotated,
+                                f"{class_name} {conf:.2f}",
+                                (px1, py1 - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.5,
+                                (0, 255, 0),
+                                2,
+                            )
+                            if conf > 0.5 and class_name in [
+                                "NO_helmet",
+                                "NO_Vest",
+                                "NO_goggles",
+                                "NO_safetyshoes",
+                            ]:
+                                zdir = os.path.join(MEDIA_ROOT, "zone_based")
+                                os.makedirs(zdir, exist_ok=True)
+                                ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                                cv2.imwrite(os.path.join(zdir, f"output_{ts}.jpg"), annotated)
+                                cv2.imwrite(os.path.join(zdir, "output.jpg"), annotated)
+            cv2.line(annotated, (int(x1), int(y1)), (int(x2), int(y2)), CLR_LINE, 2)
+            draw_label(
+                annotated,
+                "AUTO DIVIDER (VERTICAL)",
+                int((x1 + x2) / 2),
+                int((y1 + y2) / 2) - 6,
+                color=(0, 0, 0),
+                bg=(255, 255, 255),
+            )
+            cv2.putText(
+                annotated,
+                f"Zone Analysis: {zone_names[0]} / {zone_names[1]}",
+                (10, 20),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+            if annotated.shape[1] > 1920 or annotated.shape[0] > 1080:
+                scale = min(1920 / annotated.shape[1], 1080 / annotated.shape[0])
+                nw, nh = int(annotated.shape[1] * scale), int(annotated.shape[0] * scale)
+                annotated = cv2.resize(annotated, (nw, nh), interpolation=cv2.INTER_LANCZOS4)
+            _, buffer = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
+            )
+            _file_analysis_pace_realtime(frame_period, loop_t0)
+    except Exception as e:
+        print(f"[file_analysis] zone stream error: {e}")
+    finally:
+        cap.release()
+        video_processing_stop_requested = False
+        video_processing_active = False
+        current_processing_video_path = None
+        current_processing_type = None
+
+
+def generate_processed_frames4(video_path: str):
+    """Class-filtered YOLO MJPEG stream."""
+    global video_processing_stop_requested, model
+    global video_processing_active, current_processing_video_path, current_processing_type
+    _ensure_model_loaded()
+    selected_classes = list(file_analysis_selected_classes) or ["helmet", "shoes", "pvc_suit"]
+
+    ALIASES = {
+        "person": {"person", "Person"},
+        "helmet": {"helmet", "hardhat", "safety_helmet", "Helmet"},
+        "safety_vest": {"vest", "safety_vest", "Safety_Vestr"},
+        "no_helmet": {"no_helmet", "no_safety_helmet", "no_hardhat", "NO_helmet"},
+        "no_safety_vest": {"no_vest", "no_safety_vest", "NO_Vestr"},
+        "pvc_suit": {"pvc_suit", "suit"},
+        "no_pvc_suit": {"no_pvc_suit", "no_suit"},
+        "shoes": {"shoes", "safety_shoes", "boots", "Safety Shoes"},
+        "goggles": {"goggles", "safety_goggles", "glasses", "eye_protection", "Safety Goggles"},
+        "no_safety_shoes": {"no_shoes", "NO_safetyshoes", "no_boots", "no_safety_shoes"},
+        "no_goggles": {"no_goggles", "NO_goggles", "no_eye_protection", "no_safety_goggles"},
+    }
+
+    def canonicalize(name: str) -> str:
+        n = name.lower().replace(" ", "_")
+        for canon, synonyms in ALIASES.items():
+            if n == canon or n in synonyms:
+                return canon
+        return n
+
+    detect_classes_names: Set[str] = set()
+    required_ppe: Set[str] = set()
+    if selected_classes:
+        user_ppe_types = set()
+        for cls_name in selected_classes:
+            cn = canonicalize(cls_name)
+            if cn.startswith("no_"):
+                user_ppe_types.add(cn[3:])
+            else:
+                user_ppe_types.add(cn)
+        required_ppe = user_ppe_types
+        for ppe_type in required_ppe:
+            detect_classes_names.add(ppe_type)
+            detect_classes_names.add(f"no_{ppe_type}")
+    else:
+        required_ppe = {"helmet", "shoes", "goggles", "safety_vest", "pvc_suit"}
+        for ppe_type in required_ppe:
+            detect_classes_names.add(ppe_type)
+            detect_classes_names.add(f"no_{ppe_type}")
+    detect_classes_names.add("person")
+
+    names = model.names
+    model_class_map: dict = {}
+    if isinstance(names, dict):
+        for idx, name in names.items():
+            model_class_map[canonicalize(str(name))] = int(idx)
+    else:
+        for idx, name in enumerate(names):
+            model_class_map[canonicalize(str(name))] = idx
+
+    detect_class_indices: List[int] = []
+    for name in detect_classes_names:
+        if name in model_class_map:
+            detect_class_indices.append(model_class_map[name])
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        video_processing_active = False
+        current_processing_video_path = None
+        current_processing_type = None
+        return
+    frame_period = _file_analysis_frame_period_sec(cap)
+    frame_count = 0
+    consecutive_errors = 0
+    max_consecutive_errors = 5
+    try:
+        while True:
+            if video_processing_stop_requested:
+                break
+            try:
+                loop_t0 = time.perf_counter()
+                success, frame = cap.read()
+                if not success:
+                    break
+                frame_count += 1
+                consecutive_errors = 0
+                results = model.predict(
+                    frame,
+                    conf=0.3,
+                    iou=0.5,
+                    classes=detect_class_indices if detect_class_indices else None,
+                    verbose=False,
+                )
+                annotated_frame = _annotate_frame(frame, results[0], filter_by_selected=False)
+                annotated_frame = cv2.resize(annotated_frame, (640, 480))
+                _, buffer = cv2.imencode(
+                    ".jpg", annotated_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+                )
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
+                )
+                _file_analysis_pace_realtime(frame_period, loop_t0)
+            except Exception as frame_error:
+                consecutive_errors += 1
+                if consecutive_errors >= max_consecutive_errors:
+                    break
+                continue
+    except Exception as e:
+        print(f"[file_analysis] class-based stream error: {e}")
+    finally:
+        cap.release()
+        video_processing_stop_requested = False
+        video_processing_active = False
+        current_processing_video_path = None
+        current_processing_type = None
+
+
+# -----------------------------------------------------------------------------
 # Class filter & frame annotation (shared by YOLO worker, display, HTTP/WebSocket)
 # -----------------------------------------------------------------------------
 def _get_effective_violation_names() -> Set[str]:
@@ -206,6 +916,7 @@ def _annotate_frame_for_exception(frame, result, exception_type: str):
     Draw only violation-class boxes on the frame so the emailed/exception image
     clearly shows what was violated. Violation boxes are drawn in RED with
     a 'VIOLATION: <type>' label so the receiver can understand from the photo.
+    Uses the same person + spatial + confidence rules as the live pipeline.
     """
     annotated = frame.copy() if frame is not None else frame
     if annotated is None or result is None:
@@ -215,13 +926,20 @@ def _annotate_frame_for_exception(frame, result, exception_type: str):
         return annotated
     xyxy = boxes.xyxy.cpu().numpy()
     confs = boxes.conf.cpu().numpy()
-    classes = boxes.cls.cpu().numpy().astype(int)
+    cls_np = boxes.cls.cpu().numpy()
+    classes = cls_np.astype(int)
     names = result.names if hasattr(result, "names") else getattr(model, "names", {})
+    want = _normalize_exception_name_for_db(exception_type)
+    person_boxes = _person_boxes_from_frame(xyxy, cls_np, confs, names)
     for (x1, y1, x2, y2), conf, cls_id in zip(xyxy, confs, classes):
         cls_idx = int(cls_id)
         raw = names.get(cls_idx, str(cls_idx)) if isinstance(names, dict) else (names[cls_idx] if cls_idx < len(names) else str(cls_idx))
-        norm_name = (raw or "").strip().lower().replace(" ", "_")
+        norm_name = _normalize_exception_name_for_db(raw)
         if norm_name not in VIOLATION_CLASSES_FOR_LOG:
+            continue
+        if norm_name != want:
+            continue
+        if not violation_passes_person_rules(norm_name, float(conf), np.asarray([x1, y1, x2, y2], dtype=np.float32), person_boxes):
             continue
         x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
         label = f"VIOLATION: {norm_name} ({conf:.2f})"
@@ -238,6 +956,9 @@ def _annotate_frame(frame, result, filter_by_selected=True):
     Draw detection boxes on frame. Uses result from DISPLAY queue (full YOLO result with .boxes).
     When filter_by_selected=True, only draws classes in selected_class_names (from start_live_detection).
     Uses flexible matching so model names (e.g. vest, safety_shoes) match frontend ids (safety_vest, shoes).
+    Person boxes below PERSON_MIN_CONF are not drawn (avoids labeling clutter as Person 0.26, etc.).
+    PPE violation classes (no_helmet, no_vest, …) are drawn only when violation_passes_person_rules
+    is true — same rules engine as the live JSON / exception pipeline.
     """
     annotated = frame.copy()
     if result is None:
@@ -247,16 +968,30 @@ def _annotate_frame(frame, result, filter_by_selected=True):
         return annotated
     xyxy = boxes.xyxy.cpu().numpy()
     confs = boxes.conf.cpu().numpy()
-    classes = boxes.cls.cpu().numpy().astype(int)
+    cls_np = boxes.cls.cpu().numpy()
+    classes = cls_np.astype(int)
     names = result.names if hasattr(result, "names") else getattr(model, "names", {})
+    person_boxes = _person_boxes_from_frame(xyxy, cls_np, confs, names)
     for (x1, y1, x2, y2), conf, cls_id in zip(xyxy, confs, classes):
+        cls_idx = int(cls_id)
+        raw = names.get(cls_idx, str(cls_idx)) if isinstance(names, dict) else (names[cls_idx] if cls_idx < len(names) else str(cls_idx))
+        norm = _normalize_exception_name_for_db(raw)
+        if norm == "person" and float(conf) < PERSON_MIN_CONF:
+            continue
+        if norm in VIOLATION_CLASSES_FOR_LOG:
+            if not violation_passes_person_rules(
+                norm,
+                float(conf),
+                np.asarray([x1, y1, x2, y2], dtype=np.float32),
+                person_boxes,
+            ):
+                continue
         if filter_by_selected and selected_class_names:
-            raw = names.get(cls_id, str(cls_id)) if isinstance(names, dict) else (names[cls_id] if cls_id < len(names) else str(cls_id))
             cls_name = (raw or "").strip()
             if not _class_matches_selected(cls_name):
                 continue
         x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
-        label = f"{names.get(cls_id, str(cls_id))} {conf:.2f}" if isinstance(names, dict) else f"{cls_id} {conf:.2f}"
+        label = f"{raw} {conf:.2f}"
         cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
         cv2.rectangle(annotated, (x1, y1 - th - 4), (x1 + tw, y1), (0, 255, 0), -1)
@@ -379,12 +1114,14 @@ def yolo_batch_worker():
                         idx = 0 if nq == 1 else min(cam_id, nq - 1)
                         disp = {"camera_id": cam_id, "frame": frame_copy, "result": res}
                         boxes = res.boxes
+                        person_boxes: List[np.ndarray] = []
                         # Realtime detection JSON: enqueue per-frame detection summary (all classes)
                         if boxes is not None and len(boxes) > 0:
                             names = res.names if hasattr(res, "names") else getattr(model, "names", {})
                             xyxy_np = boxes.xyxy.cpu().numpy()
                             cls_np = boxes.cls.cpu().numpy()
                             conf_np = boxes.conf.cpu().numpy()
+                            person_boxes = _person_boxes_from_frame(xyxy_np, cls_np, conf_np, names)
                             detections_json = []
                             timestamp = datetime.utcnow().isoformat()
                             for (x1, y1, x2, y2), cls_id, score in zip(xyxy_np, cls_np, conf_np):
@@ -393,8 +1130,13 @@ def yolo_batch_worker():
                                     raw_name = names.get(cls_idx, str(cls_idx))
                                 else:
                                     raw_name = names[cls_idx] if 0 <= cls_idx < len(names) else str(cls_idx)
-                                norm_name = (raw_name or "").strip().lower().replace(" ", "_")
-                                is_violation = norm_name in VIOLATION_CLASSES_FOR_LOG
+                                norm_name = _normalize_exception_name_for_db(raw_name)
+                                is_violation = violation_passes_person_rules(
+                                    norm_name,
+                                    float(score),
+                                    np.asarray([x1, y1, x2, y2], dtype=np.float32),
+                                    person_boxes,
+                                )
                                 detections_json.append(
                                     {
                                         "class_id": cls_idx,
@@ -405,7 +1147,7 @@ def yolo_batch_worker():
                                         "is_violation": is_violation,
                                     }
                                 )
-                                # Append to plain-text log only for violation classes (no_helmet, no_vest, no_goggles, no_safetyshoes)
+                                # Append to plain-text log only for actionable violations (person + spatial + conf rules)
                                 if is_violation:
                                     try:
                                         os.makedirs(MEDIA_ROOT, exist_ok=True)
@@ -445,7 +1187,7 @@ def yolo_batch_worker():
                                             detection_frames_queue.put_nowait((frame_copy.copy(), res, event, cam_id))
                                         except queue.Empty:
                                             pass
-                        if len(boxes) > 0 and idx < len(pipeline_output_queues):
+                        if boxes is not None and len(boxes) > 0 and idx < len(pipeline_output_queues):
                             out_q = pipeline_output_queues[idx]
                             names = res.names if hasattr(res, "names") else getattr(model, "names", {})
                             xyxy_np = boxes.xyxy.cpu().numpy()
@@ -494,14 +1236,25 @@ def yolo_batch_worker():
                                 except queue.Empty:
                                     pass
                         # Exception log: enqueue violations for DB insert (throttled, non-blocking)
-                        if len(boxes) > 0:
+                        if boxes is not None and len(boxes) > 0:
                             names = res.names if hasattr(res, "names") else getattr(model, "names", {})
+                            xyxy_np = boxes.xyxy.cpu().numpy()
                             cls_np = boxes.cls.cpu().numpy()
+                            conf_np = boxes.conf.cpu().numpy()
                             seen_violations = set()
-                            for c in cls_np:
-                                name = (names.get(int(c), str(c)) or "").strip().lower().replace(" ", "_")
-                                if name in VIOLATION_CLASSES_FOR_LOG:
-                                    seen_violations.add(name)
+                            for i in range(len(cls_np)):
+                                raw = _raw_class_name_from_names(names, int(cls_np[i]))
+                                name = _normalize_exception_name_for_db(raw)
+                                if name not in VIOLATION_CLASSES_FOR_LOG:
+                                    continue
+                                if not violation_passes_person_rules(
+                                    name,
+                                    float(conf_np[i]),
+                                    xyxy_np[i],
+                                    person_boxes,
+                                ):
+                                    continue
+                                seen_violations.add(name)
                             if seen_violations:
                                 now = time.time()
                                 time_occurred = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -516,7 +1269,10 @@ def yolo_batch_worker():
                                                 annotated_frame = _annotate_frame_for_exception(frame_copy.copy(), res, v)
                                                 exception_log_queue.put_nowait((cam_id, annotated_frame, v, time_occurred))
                                             except queue.Full:
-                                                pass
+                                                _log_exception_pipeline(
+                                                    f"exception_log: queue full ({EXCEPTION_LOG_QUEUE_SIZE}), "
+                                                    f"dropping {v} cam={cam_id}"
+                                                )
                     
                     # Update performance stats and debug counters
                     inference_time = time.time() - start_time
@@ -596,12 +1352,12 @@ def _detection_frames_worker():
 # Exception-log worker (queue → disk → DB + email enqueue)
 # -----------------------------------------------------------------------------
 def _exception_log_worker():
-    """Background thread: consume exception_log_queue, save annotated frame (with violation boxes) to disk, INSERT into employeeinfo.exception_logs."""
+    """Background thread: consume exception_log_queue, save annotated frame (with violation boxes) to disk, INSERT into exception_logs."""
     try:
         os.makedirs(EXCEPTION_LOGS_DIR, exist_ok=True)
-        print(f"[camera_dashboard] Exception-log worker started; saving to: {EXCEPTION_LOGS_DIR}")
+        _log_exception_pipeline(f"exception_log: Exception-log worker started; saving to: {EXCEPTION_LOGS_DIR}")
     except Exception as e:
-        print(f"[camera_dashboard] exception_log: ERROR creating dir {EXCEPTION_LOGS_DIR}: {e}")
+        _log_exception_pipeline(f"exception_log: ERROR creating dir {EXCEPTION_LOGS_DIR}: {e}")
         return
     while True:
         if pipeline_stop_event.is_set():
@@ -610,53 +1366,71 @@ def _exception_log_worker():
             item = exception_log_queue.get(timeout=1.0)
         except queue.Empty:
             continue
-        # (cam_id, annotated_frame, exception_type, time_occurred) - frame is already drawn in inference loop
+        # (cam_id, annotated_frame, exception_type, time_occurred) - cam_id is pipeline stream index
         cam_id, frame, exception_type, time_occurred = item[0], item[1], item[2], item[3]
         if frame is None or not exception_type:
             continue
+        db_camera_id = _pipeline_index_to_db_camera_id(cam_id)
         safe_type = re.sub(r"[^\w\-]", "_", exception_type)[:32]
         safe_ts = re.sub(r"[^\d\-]", "_", time_occurred)[:20]
-        filename = f"exception_{safe_ts}_{cam_id}_{safe_type}.jpg"
+        filename = f"exception_{safe_ts}_{db_camera_id}_{safe_type}.jpg"
         image_path = os.path.join(EXCEPTION_LOGS_DIR, filename)
         try:
             cv2.imwrite(image_path, frame)
-            print(f"[camera_dashboard] exception_log: saved image {filename} (with violation boxes)")
+            _log_exception_pipeline(f"exception_log: saved image {filename} (with violation boxes)")
         except Exception as e:
-            print(f"[camera_dashboard] exception_log: failed to save image: {e}")
+            _log_exception_pipeline(f"exception_log: failed to save image: {e}")
+            continue
+        # exception_logs.incident_image is LONGBLOB: store JPEG bytes, not the path string.
+        try:
+            with open(image_path, "rb") as _imgf:
+                image_blob = _imgf.read()
+        except OSError as e:
+            _log_exception_pipeline(f"exception_log: failed to read image for DB: {e}")
+            continue
+        if not image_blob:
+            _log_exception_pipeline("exception_log: empty image file, skip DB insert")
             continue
         db = SessionLocal()
         try:
+            et_id = _resolve_exception_type_id(db, exception_type)
+            if et_id is None:
+                continue
+            try:
+                t_occ = datetime.strptime(time_occurred, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                t_occ = datetime.now()
             db.execute(
-                text("""
-                    INSERT INTO employeeinfo.exception_logs
-                    (time_occurred, exception_type_id, Incident_image, updated_at)
-                    VALUES (
-                        :t,
-                        (SELECT et.exception_type_id
-                         FROM employeeinfo.Exception_Type et
-                         WHERE et.exception_name = :x
-                         LIMIT 1),
-                        :i,
-                        NOW()
-                    )
-                """),
-                {"t": time_occurred, "x": exception_type, "i": image_path},
+                text(
+                    """
+                    INSERT INTO exception_logs
+                    (time_occurred, exception_type_id, incident_image, updated_at, camera_id)
+                    VALUES (:t, :eid, :i, NOW(), :cid)
+                    """
+                ),
+                {"t": t_occ, "eid": et_id, "i": image_blob, "cid": db_camera_id},
             )
             db.commit()
-            print(f"[camera_dashboard] exception_log: DB insert OK for {exception_type}")
-            # Enqueue an email notification; this is non-blocking (just adds to a queue).
+            _log_exception_pipeline(
+                f"exception_log: DB insert OK for {exception_type} (exception_type_id={et_id}) "
+                f"camera_id={db_camera_id}"
+            )
+            # Enqueue email with camera name + zone from camera (direct query on open session).
             try:
+                em_name, em_zone = _camera_name_zone_from_db(db, db_camera_id)
                 enqueue_violation_email(
-                    camera_id=int(cam_id),
+                    camera_id=db_camera_id,
                     exception_type=exception_type,
                     image_path=image_path,
                     time_occurred=time_occurred,
+                    camera_name=em_name,
+                    zone_name=em_zone,
                 )
             except Exception as e:
                 # Do not break logging if email enqueue fails.
-                print(f"[camera_dashboard] exception_log: failed to enqueue email: {e}")
+                _log_exception_pipeline(f"exception_log: failed to enqueue email: {e}")
         except Exception as e:
-            print(f"[camera_dashboard] exception_log: DB insert failed: {e}")
+            _log_exception_pipeline(f"exception_log: DB insert failed: {e}")
             db.rollback()
         finally:
             db.close()
@@ -781,10 +1555,13 @@ router = APIRouter(
     dependencies=[Depends(require_permission("camera-dashboard.view"))],
 )
 
+# MJPEG file-analysis feeds must be reachable without Authorization (browser <img> cannot send Bearer).
+public_feed_router = APIRouter(prefix="/api/camera_dashboard", tags=["camera_dashboard"])
+
 
 @router.get("/cameras")
 def get_cameras():
-    """Get list of all available cameras from employeeinfo.camera."""
+    """Get list of all available cameras from camera."""
     try:
         camera_config = get_camera_config()
         cameras = {
@@ -811,7 +1588,7 @@ class StartBody(BaseModel):
 
 
 def _mark_streams_started(camera_ids: List[str]):
-    """Insert running rows into employeeinfo.camera_streams for current live session."""
+    """Insert running rows into camera_streams for current live session."""
     db = SessionLocal()
     try:
         for cam_id in camera_ids:
@@ -821,7 +1598,7 @@ def _mark_streams_started(camera_ids: List[str]):
             db.execute(
                 text(
                     """
-                    INSERT INTO employeeinfo.camera_streams (camera_id, video_feed_url, status, started_at)
+                    INSERT INTO camera_streams (camera_id, video_feed_url, status, started_at)
                     VALUES (:camera_id, :video_feed_url, 'running', NOW())
                     """
                 ),
@@ -847,7 +1624,7 @@ def _mark_streams_stopped(camera_ids: List[str]):
             db.execute(
                 text(
                     """
-                    UPDATE employeeinfo.camera_streams
+                    UPDATE camera_streams
                     SET status = 'stopped', stopped_at = NOW()
                     WHERE camera_id = :camera_id AND status = 'running'
                     """
@@ -892,6 +1669,7 @@ def debug_storage():
     """
     Debug endpoint: storage paths, whether dirs exist, pipeline state, queue sizes, and sample files.
     Use this to see exactly where the code is broken.
+    Exception DB pipeline messages are also written to media/exception_pipeline.log; tail is included here.
     """
     def list_dir_safe(path: str, max_files: int = 20) -> List[str]:
         try:
@@ -899,6 +1677,16 @@ def debug_storage():
                 return []
             names = sorted(os.listdir(path))[:max_files]
             return names
+        except Exception:
+            return []
+
+    def tail_file(path: str, max_lines: int = 40) -> List[str]:
+        try:
+            if not os.path.isfile(path):
+                return []
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+            return [ln.rstrip("\n\r") for ln in lines[-max_lines:]]
         except Exception:
             return []
 
@@ -920,6 +1708,9 @@ def debug_storage():
         "debug_frames_with_detections": frames_with_det,
         "exception_logs_sample_files": list_dir_safe(EXCEPTION_LOGS_DIR),
         "detection_frames_sample_files": list_dir_safe(DETECTION_FRAMES_DIR),
+        "exception_pipeline_log_path": EXCEPTION_PIPELINE_LOG_PATH,
+        "exception_pipeline_log_exists": os.path.isfile(EXCEPTION_PIPELINE_LOG_PATH),
+        "exception_pipeline_log_tail": tail_file(EXCEPTION_PIPELINE_LOG_PATH, 40),
     }
 
 
@@ -993,13 +1784,11 @@ async def live_detection_feed_ws(websocket: WebSocket, camera_id: str = "0"):
     - If client sends {"mode": "webrtc"}, perform WebRTC signaling (offer/answer) and stream via WebRTC (requires aiortc).
     - Otherwise stream JPEG frames as binary for low-latency canvas rendering.
     """
-    # Auth for WebSocket clients: since browsers can't set Authorization headers reliably,
-    # we accept `?token=...` (preferred) and validate it before streaming.
-    raw_token = websocket.query_params.get("token")
-    if not raw_token:
-        auth = websocket.headers.get("authorization")
-        if auth and auth.lower().startswith("bearer "):
-            raw_token = auth.split(" ", 1)[1].strip()
+    # WebSocket auth: Authorization header only.
+    auth = websocket.headers.get("authorization")
+    raw_token = None
+    if auth and auth.lower().startswith("bearer "):
+        raw_token = auth.split(" ", 1)[1].strip()
 
     if not raw_token:
         await websocket.close(code=4401)
@@ -1008,17 +1797,18 @@ async def live_detection_feed_ws(websocket: WebSocket, camera_id: str = "0"):
     try:
         decoded = decode_access_token(raw_token)
         role = (decoded.get("role") or "").strip().lower()
+        user_id = int(decoded.get("sub"))
     except Exception:
         await websocket.close(code=4401)
         return
 
     db = SessionLocal()
     try:
-        allowed_keys = get_role_allowed_page_keys(db=db, role=role)
+        allowed_keys = get_user_allowed_page_keys(db=db, user_id=user_id, role=role)
     finally:
         db.close()
 
-    if "camera-dashboard.view" not in allowed_keys and role != "admin":
+    if "camera-dashboard.view" not in allowed_keys:
         await websocket.close(code=4403)
         return
 
@@ -1198,4 +1988,199 @@ def api_stop_live_detection():
     pipeline_stop_event.set()
     _mark_streams_stopped(current_camera_ids)
     return {"status": "success"}
+
+
+# --- File upload analysis (demo2, demo3, demo4) — matches frontend FileAnalysis.jsx + apiConfig ---
+
+
+@router.post("/demo2")
+async def file_analysis_demo2(file: UploadFile = File(...)):
+    global video_processing_active, current_processing_type, current_processing_video_path
+    global video_processing_stop_requested
+    if not file.filename:
+        raise HTTPException(status_code=400, detail={"status": "error", "error": "No selected file"})
+    if not _allowed_upload_file(file.filename):
+        raise HTTPException(status_code=400, detail={"status": "error", "error": "Invalid file type"})
+    try:
+        os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+        filename = _secure_upload_filename(file.filename)
+        sample_path = os.path.abspath(os.path.join(UPLOAD_FOLDER, filename))
+        content = await file.read()
+        with open(sample_path, "wb") as f:
+            f.write(content)
+        video_processing_active = True
+        current_processing_type = "general"
+        current_processing_video_path = sample_path
+        video_processing_stop_requested = False
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_filename = f"output_{timestamp}_{filename}"
+        vp = quote(sample_path, safe="")
+        video_feed_url = f"/api/camera_dashboard/video_feed2?video_path={vp}"
+        download_url = f"/static/uploads/{output_filename}"
+        return {
+            "status": "success",
+            "video_feed_url": video_feed_url,
+            "download_url": download_url,
+            "message": "File uploaded successfully",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail={"status": "error", "error": f"Processing failed: {str(e)}"},
+        )
+
+
+@router.post("/demo3")
+async def file_analysis_demo3(file: UploadFile = File(...)):
+    global video_processing_active, current_processing_type, current_processing_video_path, video_processing_stop_requested
+    if not file.filename:
+        raise HTTPException(status_code=400, detail={"status": "error", "error": "No selected file"})
+    if not _allowed_upload_file(file.filename):
+        raise HTTPException(status_code=400, detail={"status": "error", "error": "Invalid file type"})
+    try:
+        os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+        filename = _secure_upload_filename(file.filename)
+        sample_path = os.path.abspath(os.path.join(UPLOAD_FOLDER, filename))
+        content = await file.read()
+        with open(sample_path, "wb") as f:
+            f.write(content)
+        video_processing_active = True
+        current_processing_type = "zone"
+        current_processing_video_path = sample_path
+        video_processing_stop_requested = False
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_filename = f"output_{timestamp}_{filename}"
+        vp = quote(sample_path, safe="")
+        video_feed_url = f"/api/camera_dashboard/video_feed3?video_path={vp}"
+        download_url = f"/static/uploads/{output_filename}"
+        return {
+            "status": "success",
+            "video_feed_url": video_feed_url,
+            "download_url": download_url,
+            "message": "File uploaded successfully",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail={"status": "error", "error": f"Processing failed: {str(e)}"},
+        )
+
+
+@router.post("/demo4")
+async def file_analysis_demo4(
+    file: UploadFile = File(...),
+    classes: Optional[str] = Form("[]"),
+):
+    global video_processing_active, current_processing_type, current_processing_video_path, video_processing_stop_requested
+    global file_analysis_selected_classes
+    if not file.filename:
+        raise HTTPException(status_code=400, detail={"status": "error", "error": "No selected file"})
+    if not _allowed_upload_file(file.filename):
+        raise HTTPException(status_code=400, detail={"status": "error", "error": "Invalid file type"})
+    try:
+        selected_classes = json.loads(classes) if classes else []
+        if not isinstance(selected_classes, list):
+            selected_classes = ["helmet", "shoes", "pvc_suit"]
+    except json.JSONDecodeError:
+        selected_classes = ["helmet", "shoes", "pvc_suit"]
+    try:
+        os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+        filename = _secure_upload_filename(file.filename)
+        sample_path = os.path.abspath(os.path.join(UPLOAD_FOLDER, filename))
+        content = await file.read()
+        with open(sample_path, "wb") as f:
+            f.write(content)
+        video_processing_active = True
+        current_processing_type = "class"
+        current_processing_video_path = sample_path
+        video_processing_stop_requested = False
+        file_analysis_selected_classes = [str(x) for x in selected_classes]
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_filename = f"output_{timestamp}_{filename}"
+        vp = quote(sample_path, safe="")
+        video_feed_url = f"/api/camera_dashboard/video_feed4?video_path={vp}"
+        download_url = f"/static/uploads/{output_filename}"
+        return {
+            "status": "success",
+            "video_feed_url": video_feed_url,
+            "download_url": download_url,
+            "message": f"File uploaded successfully with classes: {file_analysis_selected_classes}",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail={"status": "error", "error": f"Processing failed: {str(e)}"},
+        )
+
+
+def _mjpeg_stream(gen):
+    return StreamingResponse(
+        gen,
+        media_type="multipart/x-mixed-replace; boundary=frame",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
+
+
+@public_feed_router.get("/video_feed2")
+def file_analysis_video_feed2(video_path: str):
+    safe = _safe_path_under_upload(unquote(video_path))
+    if not safe:
+        raise HTTPException(status_code=404, detail={"status": "error", "error": "Invalid video path"})
+    return _mjpeg_stream(generate_processed_frames2(safe))
+
+
+@public_feed_router.get("/video_feed3")
+def file_analysis_video_feed3(video_path: str):
+    safe = _safe_path_under_upload(unquote(video_path))
+    if not safe:
+        raise HTTPException(status_code=404, detail={"status": "error", "error": "Invalid video path"})
+    return _mjpeg_stream(generate_processed_frames3(safe))
+
+
+@public_feed_router.get("/video_feed4")
+def file_analysis_video_feed4(video_path: str):
+    safe = _safe_path_under_upload(unquote(video_path))
+    if not safe:
+        raise HTTPException(status_code=404, detail={"status": "error", "error": "Invalid video path"})
+    return _mjpeg_stream(generate_processed_frames4(safe))
+
+
+@router.post("/stop_video_processing")
+def file_analysis_stop_video_processing():
+    global video_processing_active, current_processing_type, current_processing_video_path, video_processing_stop_requested
+    try:
+        video_processing_stop_requested = True
+        video_processing_active = False
+        current_processing_type = None
+        current_processing_video_path = None
+        return {"status": "success", "message": "Video processing stopped successfully"}
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "status": "error",
+                "message": "Failed to stop video processing",
+                "error": str(e),
+            },
+        )
+
+
+@router.get("/video_processing_status")
+def file_analysis_video_processing_status():
+    return {
+        "processing_active": video_processing_active,
+        "processing_type": current_processing_type,
+        "video_path": current_processing_video_path,
+        "stop_requested": video_processing_stop_requested,
+    }
 

@@ -7,7 +7,7 @@ from app.database.database import SessionLocal
 
 def get_camera_config(ids: Optional[List[str]] = None) -> Dict[str, Dict[str, str]]:
     """
-    Build camera config from employeeinfo.camera.
+    Build camera config from camera.
     Keys are camera_id as strings to preserve current caller expectations.
     """
     db = SessionLocal()
@@ -15,7 +15,7 @@ def get_camera_config(ids: Optional[List[str]] = None) -> Dict[str, Dict[str, st
         query = text(
             """
             SELECT camera_id, camera_name, zone_name, ip_address, streaming_url
-            FROM employeeinfo.camera
+            FROM camera
             ORDER BY camera_id
             """
         )

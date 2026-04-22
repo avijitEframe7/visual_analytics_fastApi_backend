@@ -4,6 +4,7 @@ __pycache__/
 
 # Env
 .venv/
+<<<<<<< HEAD
 .env
 
 # Logs
@@ -17,3 +18,22 @@ ML_models/
 
 # Testing
 testing/
+=======
+logs/*
+__pycache__/*
+app/routes/__pycache__/*
+app/models/__pycache__/*
+app/utils/__pycache__/*
+app/schemas/__pycache__/*
+app/schemas/__pycache__/*
+database/__pycache__/*
+security/__pycache__/*
+routes/__pycache__/*
+logs/*
+*.md
+media/
+logs/
+logs.txt
+ML_models/
+testing
+>>>>>>> 10eac6a0a219f506c14f8b7b3a0c12a7c782300a

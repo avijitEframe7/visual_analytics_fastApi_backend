@@ -3,8 +3,10 @@
 
 import logging
 from pathlib import Path
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from app.routes import (
     users,
     health,
@@ -18,10 +20,10 @@ from app.routes import (
 )
 
 from app.database.database import Base, engine, SessionLocal
-from app.security.rbac import seed_default_role_page_permissions
+from app.security.rbac import seed_default_user_page_permissions
 from app.models.users import User  # noqa: F401 (ensure model is registered in metadata)
 from app.models.roles import Role  # noqa: F401
-from app.models.role_page_permissions import RolePagePermission  # noqa: F401
+from app.models.user_page_permissions import UserPagePermission  # noqa: F401
 
 # Configure logging
 log_dir = Path("logs")
@@ -59,13 +61,13 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup_event():
     logger.info("Starting Visual Analytics API...")
-    # Ensure RBAC tables exist (dev-friendly) and seed default role permissions.
+    # Ensure RBAC tables exist (dev-friendly) and seed default per-user page permissions.
     # In production, prefer migrations instead of auto-creating tables.
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
     try:
-        seed_default_role_page_permissions(db)
-        logger.info("RBAC role/page permissions seeded")
+        seed_default_user_page_permissions(db)
+        logger.info("RBAC user page permissions seeded")
     finally:
         db.close()
     logger.info("Application startup complete")
@@ -82,11 +84,18 @@ app.include_router(users.router)
 app.include_router(health.router)
 app.include_router(auth.router)
 app.include_router(main_dashboard.router)
+app.include_router(camera_dashboard.public_feed_router)
 app.include_router(camera_dashboard.router)
 app.include_router(model_management.router)
 app.include_router(camera_management.router)
 app.include_router(notification_management.router)
 app.include_router(email_feature.router)
+
+# Serve media/uploads for file-analysis download URLs (/static/uploads/...)
+_media_root = Path(__file__).resolve().parent / "media"
+_media_root.mkdir(parents=True, exist_ok=True)
+(_media_root / "uploads").mkdir(parents=True, exist_ok=True)
+app.mount("/static", StaticFiles(directory=str(_media_root)), name="static")
 
 # Root endpoint
 

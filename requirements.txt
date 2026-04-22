@@ -52,8 +52,7 @@ pycparser==2.23
 pydantic==2.12.5
 pydantic-core==2.41.5
 pyee==13.0.0
-pyodbc==5.2.0
-pyopenssl==25.1.0
+pyopenssl==24.3.0
 pyparsing==3.3.2
 pyreadline3==3.5.4
 python-dateutil==2.9.0.post0

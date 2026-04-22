@@ -30,7 +30,7 @@ class CameraDeleteRequest(BaseModel):
 def get_cameras(db: Session = Depends(get_db)):
     """Get all cameras."""
     try:
-        result = db.execute(text("SELECT * FROM employeeinfo.camera"))
+        result = db.execute(text("SELECT * FROM camera"))
         cameras = result.mappings().all()
         return cameras
     except Exception as e:
@@ -43,12 +43,12 @@ def get_cameras(db: Session = Depends(get_db)):
     dependencies=[Depends(require_permission("camera-dashboard.control"))],
 )
 def set_camera(data: CameraCreateRequest, db: Session = Depends(get_db)):
-    """Insert a camera into employeeinfo.camera."""
+    """Insert a camera into camera."""
     try:
         db.execute(
             text(
                 """
-                INSERT INTO employeeinfo.camera
+                INSERT INTO camera
                 (camera_id, camera_name, zone_name, ip_address, streaming_url)
                 VALUES (:camera_id, :camera_name, :zone_name, :ip_address, :streaming_url)
                 """
@@ -74,10 +74,10 @@ def set_camera(data: CameraCreateRequest, db: Session = Depends(get_db)):
     dependencies=[Depends(require_permission("camera-dashboard.control"))],
 )
 def del_camera(data: CameraDeleteRequest, db: Session = Depends(get_db)):
-    """Delete a camera from employeeinfo.camera by camera_id."""
+    """Delete a camera from camera by camera_id."""
     try:
         result = db.execute(
-            text("DELETE FROM employeeinfo.camera WHERE camera_id = :camera_id"),
+            text("DELETE FROM camera WHERE camera_id = :camera_id"),
             {"camera_id": data.camera_id},
         )
         db.commit()
