@@ -50,8 +50,10 @@ for _p in _trt_paths:
 # -----------------------------------------------------------------------------
 RTSP_URLS: List[str] = []
 
-# FPS / throughput: skip every Nth frame; resize before inference
+# Live RTSP: process every Nth frame (1 = all frames, 2 = every other frame, etc.). Used by rtsp_reader only.
 FRAME_SKIP = 1
+# File upload / video analysis: 0 = do not skip any frame (run model on every decoded frame). N>=2 = only every Nth.
+FILE_ANALYSIS_FRAME_SKIP = 0
 RESIZE = (640, 460)
 BATCH_SIZE = 4
 QUEUE_SIZE = 50
@@ -499,32 +501,111 @@ def _safe_path_under_upload(video_path: str) -> Optional[str]:
         return None
 
 
+# File-analysis MJPEG: same JPEG quality as live_detection_feed (default quality=82).
+LIVE_MJPEG_JPEG_QUALITY = 82
+
+def _file_analysis_pacing_max_fps() -> float:
+    """
+    Wall-clock cap for how fast the file-analysis MJPEG can advance (independent of video metadata).
+    Lower = calmer on-screen (e.g. 6–10 feels like "normal" review speed). Range 1–30.
+
+    Set in environment (optional): FILE_ANALYSIS_PACING_FPS_MAX=8
+    """
+    try:
+        raw = (os.environ.get("FILE_ANALYSIS_PACING_FPS_MAX", "") or "").strip()
+        v = float(raw) if raw else 8.0
+    except ValueError:
+        v = 8.0
+    return max(1.0, min(30.0, v))
+
+
 def _file_analysis_frame_period_sec(cap: cv2.VideoCapture) -> float:
-    """Target seconds between frames to match the source file's nominal FPS (playback speed)."""
+    """
+    Target seconds per *decoded* frame: min(video metadata FPS, _file_analysis_pacing_max_fps()).
+    If the clip still “flies”, lower FILE_ANALYSIS_PACING_FPS_MAX (e.g. 5–8).
+    """
+    cap_on = _file_analysis_pacing_max_fps()
     fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-    if fps <= 1.0 or fps > 120.0:
-        fps = 25.0
+    if math.isnan(fps) or fps <= 1.0 or fps > 120.0:
+        fps = 0.0
+    if fps <= 0.0:
+        fps = cap_on
+    # Slower/unknown clips: at least 3 FPS so we do not hang on a single frame.
+    fps = min(cap_on, max(3.0, fps))
     return 1.0 / fps
 
 
-def _file_analysis_pace_realtime(period_sec: float, loop_start: float) -> None:
-    """Sleep so wall time since loop_start reaches one frame period (original playback speed)."""
-    elapsed = time.perf_counter() - loop_start
-    rem = period_sec - elapsed
-    if rem > 0:
-        time.sleep(rem)
+def _file_analysis_wait_frame_slot(period: float, slot: List[float]) -> None:
+    """
+    Block until the next wall-clock frame slot, then schedule the next one.
+    Called once per cap.read() *before* processing so the MJPEG `yield` cannot
+    cause the next frame to start as soon as the client drains (which looked “too fast”).
+
+    slot[0] = next start time (perf_counter), initialized on first call.
+    """
+    if not slot:
+        slot.append(time.perf_counter())
+    deadline = slot[0]
+    now = time.perf_counter()
+    if now < deadline:
+        time.sleep(deadline - now)
+    slot[0] = deadline + period
+    if time.perf_counter() > slot[0]:
+        slot[0] = time.perf_counter() + period
 
 
-def _yolo_all_class_indices() -> List[int]:
+def _file_analysis_should_skip_frame(frame_n: int) -> bool:
+    """True to skip this frame (no YOLO / no output). FILE_ANALYSIS_FRAME_SKIP 0 = never skip."""
+    n = FILE_ANALYSIS_FRAME_SKIP
+    if n <= 0:
+        return False
+    return (frame_n % n) != 0
+
+
+def _file_analysis_resize_for_inference(bgr: np.ndarray) -> np.ndarray:
+    """Match rtsp_reader: fixed size before YOLO (same as live stream)."""
+    if bgr is None or bgr.size == 0:
+        return bgr
+    if bgr.shape[:2] != RESIZE[::-1]:
+        return cv2.resize(bgr, RESIZE, interpolation=cv2.INTER_LINEAR)
+    return bgr
+
+
+def _file_analysis_infer(
+    bgr: np.ndarray,
+    *,
+    conf: float = 0.25,
+    iou: float = 0.45,
+    classes: Optional[List[int]] = None,
+):
+    """
+    Same call style as yolo_batch_worker: model([frame], device=DEVICE, ...).
+    Returns first result (with .boxes) for _annotate_frame, or None on failure.
+    """
     _ensure_model_loaded()
-    names = model.names
-    if isinstance(names, dict):
-        return list(names.keys())
-    return list(range(len(names)))
+    try:
+        with torch.inference_mode():
+            kwargs: dict = {
+                "device": DEVICE,
+                "stream": False,
+                "verbose": False,
+                "conf": conf,
+                "iou": iou,
+            }
+            if classes is not None and len(classes) > 0:
+                kwargs["classes"] = classes
+            res = model([bgr], **kwargs)
+            return res[0] if res else None
+    except Exception as e:
+        print(f"[file_analysis] YOLO infer error: {e}")
+        return None
 
 
 def generate_processed_frames2(video_path: str):
-    """YOLO-processed MJPEG stream from a video file (general detection)."""
+    """
+    MJPEG from file: same RESIZE and YOLO call style as live RTSP; wall-clock throttled; optional
+    FILE_ANALYSIS_FRAME_SKIP (0 = all frames).
+    """
     global video_processing_stop_requested, model
     global video_processing_active, current_processing_video_path, current_processing_type
     _ensure_model_loaded()
@@ -534,82 +615,74 @@ def generate_processed_frames2(video_path: str):
         current_processing_video_path = None
         current_processing_type = None
         return
-    frame_period = _file_analysis_frame_period_sec(cap)
+    period = _file_analysis_frame_period_sec(cap)
+    wall_clock: List[float] = []
     frame_counter = 0
     try:
         while True:
-            loop_t0 = time.perf_counter()
             if video_processing_stop_requested:
                 break
+            _file_analysis_wait_frame_slot(period, wall_clock)
             success, img = cap.read()
             if not success:
                 break
             frame_counter += 1
+            if _file_analysis_should_skip_frame(frame_counter):
+                continue
             if img is None or img.size == 0:
                 continue
+            img = _file_analysis_resize_for_inference(img)
             curr_datetime = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            try:
-                all_class_indices = _yolo_all_class_indices()
-                results = model.predict(
-                    img, conf=0.25, iou=0.45, classes=all_class_indices, verbose=False
-                )
-            except Exception as yolo_error:
-                print(f"[file_analysis] YOLO error frame {frame_counter}: {yolo_error}")
+            r = _file_analysis_infer(img, conf=0.25, iou=0.45, classes=None)
+            if r is None:
                 continue
             try:
-                annotated_img = img
-                for r in results:
-                    if r is not None:
-                        annotated_img = _annotate_frame(img, r, filter_by_selected=False)
-                        break
-                for r in results:
-                    if r is None:
-                        continue
-                    boxes = r.boxes
-                    if boxes is None:
-                        break
-                    for box in boxes:
-                        conf = math.ceil((box.conf[0] * 100)) / 100
-                        cls = int(box.cls[0])
-                        raw = model.names.get(cls, str(cls)) if isinstance(model.names, dict) else (
-                            model.names[cls] if cls < len(model.names) else str(cls)
-                        )
-                        current_class = str(raw)
-                        violation_classes = [
-                            "NO_helmet",
-                            "NO_Vest",
-                            "NO_goggles",
-                            "NO_SafetyShoes",
-                            "NO_Gloves",
-                        ]
-                        is_violation = current_class in violation_classes
-                        if conf > 0.5 and is_violation:
-                            try:
-                                face_dir = os.path.join(MEDIA_ROOT, "face_detect")
-                                os.makedirs(face_dir, exist_ok=True)
-                                cv2.imwrite(
-                                    os.path.join(face_dir, f"output{curr_datetime}.jpg"),
-                                    annotated_img,
-                                )
-                                cv2.imwrite(os.path.join(face_dir, "output.jpg"), annotated_img)
-                            except Exception as write_error:
-                                print(f"[file_analysis] save violation image: {write_error}")
-                    break
-                img = annotated_img
+                annotated_img = _annotate_frame(img, r, filter_by_selected=False)
             except Exception as results_error:
-                print(f"[file_analysis] results error frame {frame_counter}: {results_error}")
+                print(f"[file_analysis] annotate error frame {frame_counter}: {results_error}")
                 continue
-            img = cv2.resize(img, (640, 480))
-            if img is None or img.size == 0:
-                continue
-            ok, buffer = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            boxes = r.boxes
+            if boxes is not None and len(boxes) > 0:
+                names = (
+                    r.names
+                    if hasattr(r, "names") and r.names is not None
+                    else getattr(model, "names", {})
+                )
+                for box in boxes:
+                    conf = math.ceil((box.conf[0] * 100)) / 100
+                    cls = int(box.cls[0])
+                    raw = names.get(cls, str(cls)) if isinstance(names, dict) else (
+                        names[cls] if cls < len(names) else str(cls)
+                    )
+                    current_class = str(raw)
+                    violation_classes = [
+                        "NO_helmet",
+                        "NO_Vest",
+                        "NO_goggles",
+                        "NO_SafetyShoes",
+                        "NO_Gloves",
+                    ]
+                    if conf > 0.5 and current_class in violation_classes:
+                        try:
+                            face_dir = os.path.join(MEDIA_ROOT, "face_detect")
+                            os.makedirs(face_dir, exist_ok=True)
+                            cv2.imwrite(
+                                os.path.join(face_dir, f"output{curr_datetime}.jpg"),
+                                annotated_img,
+                            )
+                            cv2.imwrite(os.path.join(face_dir, "output.jpg"), annotated_img)
+                        except Exception as write_error:
+                            print(f"[file_analysis] save violation image: {write_error}")
+                    break
+            ok, buffer = cv2.imencode(
+                ".jpg", annotated_img, [cv2.IMWRITE_JPEG_QUALITY, LIVE_MJPEG_JPEG_QUALITY]
+            )
             if not ok or buffer is None:
                 continue
             yield (
                 b"--frame\r\n"
                 b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
             )
-            _file_analysis_pace_realtime(frame_period, loop_t0)
     except Exception as e:
         print(f"[file_analysis] stream error: {e}")
     finally:
@@ -621,7 +694,7 @@ def generate_processed_frames2(video_path: str):
 
 
 def generate_processed_frames3(video_path: str):
-    """Zone-based PPE MJPEG stream (vertical divider)."""
+    """Zone PPE MJPEG: FILE_ANALYSIS_FRAME_SKIP, RESIZE, infer, JPEG; paced to file FPS (see demo2)."""
     global video_processing_stop_requested, model
     global video_processing_active, current_processing_video_path, current_processing_type
     _ensure_model_loaded()
@@ -633,9 +706,10 @@ def generate_processed_frames3(video_path: str):
         current_processing_video_path = None
         current_processing_type = None
         return
-    frame_period = _file_analysis_frame_period_sec(cap)
-    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    period = _file_analysis_frame_period_sec(cap)
+    wall_clock: List[float] = []
+    frame_counter = 0
+    W, H = RESIZE[0], RESIZE[1]
     x_mid = W // 2
     divider = [x_mid, 0, x_mid, H - 1]
     zone_names = ("LEFT", "RIGHT")
@@ -652,16 +726,24 @@ def generate_processed_frames3(video_path: str):
 
     try:
         while True:
-            loop_t0 = time.perf_counter()
             if video_processing_stop_requested:
                 break
+            _file_analysis_wait_frame_slot(period, wall_clock)
             success, frame = cap.read()
             if not success:
                 break
-            results = model.predict(frame, conf=CONF_THRES, iou=IOU_THRES, verbose=False)
+            frame_counter += 1
+            if _file_analysis_should_skip_frame(frame_counter):
+                continue
+            frame = _file_analysis_resize_for_inference(frame)
+            if frame is None or frame.size == 0:
+                continue
+            r0 = _file_analysis_infer(frame, conf=CONF_THRES, iou=IOU_THRES, classes=None)
+            if r0 is None:
+                continue
             annotated = frame.copy()
-            dets = results[0].boxes
-            names = model.names
+            dets = r0.boxes
+            names = r0.names if hasattr(r0, "names") and r0.names is not None else model.names
             if dets is not None and len(dets) > 0:
                 for i in range(len(dets)):
                     xyxy = dets.xyxy[i].cpu().tolist()
@@ -743,16 +825,15 @@ def generate_processed_frames3(video_path: str):
                 1,
                 cv2.LINE_AA,
             )
-            if annotated.shape[1] > 1920 or annotated.shape[0] > 1080:
-                scale = min(1920 / annotated.shape[1], 1080 / annotated.shape[0])
-                nw, nh = int(annotated.shape[1] * scale), int(annotated.shape[0] * scale)
-                annotated = cv2.resize(annotated, (nw, nh), interpolation=cv2.INTER_LANCZOS4)
-            _, buffer = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+            _, buffer = cv2.imencode(
+                ".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, LIVE_MJPEG_JPEG_QUALITY]
+            )
+            if buffer is None:
+                continue
             yield (
                 b"--frame\r\n"
                 b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
             )
-            _file_analysis_pace_realtime(frame_period, loop_t0)
     except Exception as e:
         print(f"[file_analysis] zone stream error: {e}")
     finally:
@@ -764,7 +845,7 @@ def generate_processed_frames3(video_path: str):
 
 
 def generate_processed_frames4(video_path: str):
-    """Class-filtered YOLO MJPEG stream."""
+    """Class-filtered YOLO MJPEG: FILE_ANALYSIS_FRAME_SKIP, RESIZE, infer, JPEG, FPS pacing (demo2/3)."""
     global video_processing_stop_requested, model
     global video_processing_active, current_processing_video_path, current_processing_type
     _ensure_model_loaded()
@@ -832,42 +913,44 @@ def generate_processed_frames4(video_path: str):
         current_processing_video_path = None
         current_processing_type = None
         return
-    frame_period = _file_analysis_frame_period_sec(cap)
+    period = _file_analysis_frame_period_sec(cap)
+    wall_clock: List[float] = []
     frame_count = 0
-    consecutive_errors = 0
-    max_consecutive_errors = 5
     try:
         while True:
             if video_processing_stop_requested:
                 break
+            _file_analysis_wait_frame_slot(period, wall_clock)
             try:
-                loop_t0 = time.perf_counter()
                 success, frame = cap.read()
                 if not success:
                     break
                 frame_count += 1
-                consecutive_errors = 0
-                results = model.predict(
-                    frame,
-                    conf=0.3,
-                    iou=0.5,
-                    classes=detect_class_indices if detect_class_indices else None,
-                    verbose=False,
+                if _file_analysis_should_skip_frame(frame_count):
+                    continue
+                frame = _file_analysis_resize_for_inference(frame)
+                if frame is None or frame.size == 0:
+                    continue
+                cls_arg = detect_class_indices if detect_class_indices else None
+                r0 = _file_analysis_infer(
+                    frame, conf=0.3, iou=0.5, classes=cls_arg
                 )
-                annotated_frame = _annotate_frame(frame, results[0], filter_by_selected=False)
-                annotated_frame = cv2.resize(annotated_frame, (640, 480))
+                if r0 is None:
+                    continue
+                annotated_frame = _annotate_frame(frame, r0, filter_by_selected=False)
                 _, buffer = cv2.imencode(
-                    ".jpg", annotated_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+                    ".jpg",
+                    annotated_frame,
+                    [cv2.IMWRITE_JPEG_QUALITY, LIVE_MJPEG_JPEG_QUALITY],
                 )
+                if buffer is None:
+                    continue
                 yield (
                     b"--frame\r\n"
                     b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
                 )
-                _file_analysis_pace_realtime(frame_period, loop_t0)
             except Exception as frame_error:
-                consecutive_errors += 1
-                if consecutive_errors >= max_consecutive_errors:
-                    break
+                print(f"[file_analysis] class-based frame error: {frame_error}")
                 continue
     except Exception as e:
         print(f"[file_analysis] class-based stream error: {e}")
