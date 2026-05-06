@@ -1,6 +1,7 @@
 .venv/
 logs/*
-__pycache__/*
+__pycache__/
+*.pyc
 app/routes/__pycache__/*
 app/models/__pycache__/*
 app/utils/__pycache__/*
