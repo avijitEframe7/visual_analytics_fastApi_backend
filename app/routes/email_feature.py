@@ -3,12 +3,16 @@ import smtplib
 import ssl
 import threading
 import queue
+import asyncio
 from typing import Optional, Dict, Any, List
 from email.message import EmailMessage
 
 from fastapi import APIRouter, Depends
+from dotenv import load_dotenv
 
 from app.security.rbac import require_role
+
+load_dotenv()
 
 
 router = APIRouter(
@@ -22,22 +26,33 @@ router = APIRouter(
 # CONFIG (hardcoded sender/receiver for now)
 # ======================
 
-# Receiver
-RECEIVER_EMAIL = "koushik.eframe@gmail.com"
+# Default violation alert recipients (used if VIOLATION_EMAIL_TO env is unset).
+# You can list several addresses here, or set VIOLATION_EMAIL_TO in .env as comma- or semicolon-separated.
+DEFAULT_VIOLATION_RECIPIENTS: List[str] = [
+    os.environ.get("RECEIVER_EMAIL")
+]
 
-GMAIL_ADDRESS: Optional[str] = "eframeinterns@gmail.com"
-GMAIL_APP_PASSWORD: Optional[str] = "ibfx koos skrd rinb"
-GMAIL_SMTP_SERVER = "smtp.gmail.com"
-GMAIL_SMTP_PORT_SSL = 465  # using SSL port for Gmail
+GMAIL_ADDRESS: Optional[str] = os.environ.get("EMAIL_ADDRESS")
+GMAIL_APP_PASSWORD: Optional[str] = os.environ.get("EMAIL_PASSWORD")
+GMAIL_SMTP_SERVER = os.environ.get("SMTP_SERVER")
+GMAIL_SMTP_PORT_SSL = os.environ.get("SMTP_PORT")  # using SSL port for Gmail
 
 # Temporary Office365 credentials (from ppe_kit_detector.py 29-32) - not used by this module
-EMAIL_ADDRESS = "eframeAI@outlook.com"
-EMAIL_PASSWORD = "lfmpzajspuopbrrr"
-SMTP_SERVER = "smtp.office365.com"
-SMTP_PORT = 587
+# EMAIL_ADDRESS = "eframeAI@outlook.com"
+# EMAIL_PASSWORD = "lfmpzajspuopbrrr"
+# SMTP_SERVER = "smtp.office365.com"
+# SMTP_PORT = 587
 
-# For now, send all violation emails to this receiver
-VIOLATION_EMAIL_TO: Optional[str] = RECEIVER_EMAIL
+def _parse_violation_recipients_from_env() -> List[str]:
+    raw = (os.environ.get("VIOLATION_EMAIL_TO") or "").strip()
+    if not raw:
+        return list(DEFAULT_VIOLATION_RECIPIENTS)
+    parts = [p.strip() for p in raw.replace(";", ",").split(",") if p.strip()]
+    return parts if parts else list(DEFAULT_VIOLATION_RECIPIENTS)
+
+
+# All violation emails go to these addresses (one SMTP message, multiple To).
+VIOLATION_EMAIL_RECIPIENTS: List[str] = _parse_violation_recipients_from_env()
 
 
 # ======================
@@ -55,7 +70,7 @@ def _have_valid_email_config() -> bool:
     """
     True if we have enough configuration to try sending email.
     """
-    return bool(GMAIL_ADDRESS and GMAIL_APP_PASSWORD and VIOLATION_EMAIL_TO)
+    return bool(GMAIL_ADDRESS and GMAIL_APP_PASSWORD and VIOLATION_EMAIL_RECIPIENTS)
 
 
 def _send_email_synchronously(payload: Dict[str, Any]) -> None:
@@ -68,7 +83,9 @@ def _send_email_synchronously(payload: Dict[str, Any]) -> None:
 
     subject: str = payload.get("subject", "PPE Violation Detected")
     body: str = payload.get("body", "")
-    to_addrs: List[str] = payload.get("to", [VIOLATION_EMAIL_TO]) or [VIOLATION_EMAIL_TO]  # type: ignore[list-item]
+    to_addrs: List[str] = [a for a in (payload.get("to") or VIOLATION_EMAIL_RECIPIENTS) if a]
+    if not to_addrs:
+        return
     image_path: Optional[str] = payload.get("image_path")
 
     msg = EmailMessage()
@@ -148,6 +165,50 @@ def _format_camera_line_for_email(
     return name
 
 
+def _build_violation_email_payload(
+    camera_id: int,
+    exception_type: str,
+    image_path: str,
+    time_occurred: str,
+    *,
+    camera_name: Optional[str] = None,
+    zone_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    display_name = (camera_name or "").strip() or f"Camera {camera_id}"
+    camera_line = _format_camera_line_for_email(camera_id, camera_name, zone_name)
+    subject = f"PPE Violation: {exception_type} — {display_name}"
+    lines = [
+        "PPE violation detected.",
+        "",
+        f"Camera: {camera_line}",
+        "",
+        f"Violation   : {exception_type}",
+        f"Time        : {time_occurred}",
+    ]
+    body = "\n".join(lines)
+
+    return {
+        "subject": subject,
+        "body": body,
+        "to": list(VIOLATION_EMAIL_RECIPIENTS),
+        "image_path": image_path,
+    }
+
+
+def _enqueue_payload(payload: Dict[str, Any]) -> None:
+    _ensure_email_worker()
+    try:
+        _email_queue.put_nowait(payload)
+    except queue.Full:
+        # Drop the oldest email to keep queue fresh and avoid blocking
+        try:
+            _email_queue.get_nowait()
+            _email_queue.put_nowait(payload)
+            print("[email_feature] Email queue full, dropped oldest item")
+        except queue.Empty:
+            pass
+
+
 def enqueue_violation_email(
     camera_id: int,
     exception_type: str,
@@ -169,44 +230,46 @@ def enqueue_violation_email(
         if not _email_config_warning_logged:
             print(
                 "[email_feature] Email configuration missing. "
-                "Set GMAIL_ADDRESS, GMAIL_APP_PASSWORD, and optionally VIOLATION_EMAIL_TO "
-                "in environment/.env to enable violation email alerts."
+                "Set GMAIL_ADDRESS, GMAIL_APP_PASSWORD, and VIOLATION_EMAIL_TO "
+                "(comma-separated for multiple recipients) in environment/.env to enable violation email alerts."
             )
             _email_config_warning_logged = True
         return
 
-    _ensure_email_worker()
+    payload = _build_violation_email_payload(
+        camera_id=camera_id,
+        exception_type=exception_type,
+        image_path=image_path,
+        time_occurred=time_occurred,
+        camera_name=camera_name,
+        zone_name=zone_name,
+    )
+    _enqueue_payload(payload)
 
-    display_name = (camera_name or "").strip() or f"Camera {camera_id}"
-    camera_line = _format_camera_line_for_email(camera_id, camera_name, zone_name)
-    subject = f"PPE Violation: {exception_type} — {display_name}"
-    lines = [
-        "PPE violation detected.",
-        "",
-        f"Camera: {camera_line}",
-        "",
-        f"Violation   : {exception_type}",
-        f"Time        : {time_occurred}",
-    ]
-    body = "\n".join(lines)
 
-    payload = {
-        "subject": subject,
-        "body": body,
-        "to": [VIOLATION_EMAIL_TO],
-        "image_path": image_path,
-    }
-
-    try:
-        _email_queue.put_nowait(payload)
-    except queue.Full:
-        # Drop the oldest email to keep queue fresh and avoid blocking
-        try:
-            _email_queue.get_nowait()
-            _email_queue.put_nowait(payload)
-            print("[email_feature] Email queue full, dropped oldest item")
-        except queue.Empty:
-            pass
+async def enqueue_violation_email_async(
+    camera_id: int,
+    exception_type: str,
+    image_path: str,
+    time_occurred: str,
+    *,
+    camera_name: Optional[str] = None,
+    zone_name: Optional[str] = None,
+) -> None:
+    """
+    Async-friendly wrapper for async callers.
+    Enqueue remains non-blocking; SMTP send still runs in background worker thread.
+    """
+    enqueue_violation_email(
+        camera_id=camera_id,
+        exception_type=exception_type,
+        image_path=image_path,
+        time_occurred=time_occurred,
+        camera_name=camera_name,
+        zone_name=zone_name,
+    )
+    # Yield once so async pipelines can continue fairly.
+    await asyncio.sleep(0)
 
 
 @router.get("/status")
@@ -215,7 +278,8 @@ def email_status() -> dict:
     out = {
         "configured": _have_valid_email_config(),
         "gmail_address": GMAIL_ADDRESS,
-        "violation_email_to": VIOLATION_EMAIL_TO,
+        "violation_email_to": ", ".join(VIOLATION_EMAIL_RECIPIENTS),
+        "violation_email_recipients": VIOLATION_EMAIL_RECIPIENTS,
         "queue_size": _email_queue.qsize(),
         "queue_maxsize": EMAIL_QUEUE_MAXSIZE,
         "worker_started": _email_worker_started,

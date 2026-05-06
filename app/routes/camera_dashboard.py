@@ -8,6 +8,7 @@ import re
 import sys
 import threading
 import time
+from dotenv import load_dotenv
 from datetime import datetime
 from typing import Any, List, Optional, Set, Tuple
 from urllib.parse import quote, unquote
@@ -29,6 +30,8 @@ from app.security.rbac import (
     get_user_allowed_page_keys,
     require_permission,
 )
+
+load_dotenv()
 
 # Add TensorRT DLL search paths before any TensorRT/Ultralytics use (fixes nvinfer_10.dll not found)
 _script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -131,11 +134,14 @@ MODEL_NORMALIZED_TO_DB_EXCEPTION_NAME: dict[str, str] = {
     "no_vest": "no_safety_vest",
     "no_safetyshoes": "no_safety_shoes",
 }
-EXCEPTION_LOG_THROTTLE_SECONDS = 180
+EXCEPTION_LOG_THROTTLE_SECONDS = os.environ.get("EMAIL_SENDING_THROTTLE_SECONDS")
 EXCEPTION_LOG_QUEUE_SIZE = 32
 exception_log_queue: queue.Queue = queue.Queue(maxsize=EXCEPTION_LOG_QUEUE_SIZE)
 _last_exception_log_time: dict = {}  # (cam_id, exception_type) -> time.time()
 _exception_log_time_lock = threading.Lock()
+EMAIL_ENQUEUE_THROTTLE_SECONDS = os.environ.get("EMAIL_SENDING_THROTTLE_SECONDS")
+_last_email_enqueue_time: dict = {}  # (db_camera_id, exception_type) -> time.time()
+_email_enqueue_time_lock = threading.Lock()
 
 # Realtime detection JSON queue: per-frame detection summaries for external consumers
 DETECTION_JSON_QUEUE_SIZE = 256
@@ -1414,16 +1420,26 @@ def _exception_log_worker():
                 f"camera_id={db_camera_id}"
             )
             # Enqueue email with camera name + zone from dbo.camera (direct query on open session).
+            # Throttled separately to keep email notifications at 1-minute intervals.
             try:
-                em_name, em_zone = _camera_name_zone_from_db(db, db_camera_id)
-                enqueue_violation_email(
-                    camera_id=db_camera_id,
-                    exception_type=exception_type,
-                    image_path=image_path,
-                    time_occurred=time_occurred,
-                    camera_name=em_name,
-                    zone_name=em_zone,
-                )
+                should_enqueue_email = False
+                now = time.time()
+                email_key = (db_camera_id, exception_type)
+                with _email_enqueue_time_lock:
+                    last_email = _last_email_enqueue_time.get(email_key, 0.0)
+                    if now - last_email >= EMAIL_ENQUEUE_THROTTLE_SECONDS:
+                        _last_email_enqueue_time[email_key] = now
+                        should_enqueue_email = True
+                if should_enqueue_email:
+                    em_name, em_zone = _camera_name_zone_from_db(db, db_camera_id)
+                    enqueue_violation_email(
+                        camera_id=db_camera_id,
+                        exception_type=exception_type,
+                        image_path=image_path,
+                        time_occurred=time_occurred,
+                        camera_name=em_name,
+                        zone_name=em_zone,
+                    )
             except Exception as e:
                 # Do not break logging if email enqueue fails.
                 _log_exception_pipeline(f"exception_log: failed to enqueue email: {e}")
