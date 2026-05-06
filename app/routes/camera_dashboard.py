@@ -434,7 +434,7 @@ def _ensure_detection_log_file():
 # YOLO model (GPU; loaded on first /start_live_detection, not on import)
 # -----------------------------------------------------------------------------
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "ML_models", "latest_16_1_2026.engine"))
+MODEL_PATH = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "ML_models", "Model_27_04_2026.engine"))
 model = None
 DEVICE = "cuda:0"
 

@@ -1,4 +1,6 @@
 .venv/
+app/ML_models/*
+!app/ML_models/Model_27_04_2026.engine
 logs/*
 __pycache__/
 *.pyc
@@ -15,5 +17,4 @@ logs/*
 media/
 logs/
 logs.txt
-ML_models/
 testing
