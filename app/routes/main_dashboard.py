@@ -1,14 +1,16 @@
 from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import text
+from datetime import date as date_type
 from datetime import datetime, timedelta
 import calendar
 from collections import Counter
-from typing import Any
+from typing import Any, List, Dict
 import io
 
 from fastapi.responses import StreamingResponse
 from app.database.database import get_db
+from app.security.rbac import require_permission
 
 # Helper functions
 def decode_bytes(val: Any) -> str:
@@ -27,9 +29,30 @@ def safe_datetime_str(val: Any) -> str:
         return val.strftime("%Y-%m-%d %H:%M:%S")
     return str(val)
 
+
+def _row_to_date(val: Any):
+    """Normalize SQL date/datetime for comparison with Python date (weekly trend)."""
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val.date()
+    if isinstance(val, date_type):
+        return val
+    return val
+
+
+def _row_period_int(val: Any) -> int:
+    if val is None:
+        return 0
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return int(float(val))
+
 router = APIRouter(
     prefix="/api/main_dashboard",
-    tags=["Main Dashboard"]
+    tags=["Main Dashboard"],
+    dependencies=[Depends(require_permission("dashboard.view"))],
 )
 
 @router.get("/trend_analysis")
@@ -40,58 +63,63 @@ def fetch_logs_by_trend_analysis(
     # ----------------------------
     # 1️⃣ Select query by range
     # ----------------------------
+    # SQL Server: cannot GROUP BY SELECT aliases (period, label). Use expressions or subqueries.
     if time_range == "weekly":
         query = text("""
-            SELECT 
-                DAYNAME(time_occurred) AS label,
-                DATE(time_occurred) AS date_val,
+            SELECT
+                DATENAME(WEEKDAY, el.time_occurred) AS label,
+                CAST(el.time_occurred AS DATE) AS date_val,
                 COUNT(*) AS count
-            FROM exception_logs
-            WHERE time_occurred >= DATE_SUB(NOW(), INTERVAL 7 DAY)
-            GROUP BY DATE(time_occurred), DAYNAME(time_occurred)
-            ORDER BY DATE(time_occurred)
+            FROM dbo.exception_logs el
+            WHERE el.time_occurred >= DATEADD(DAY, -7, GETDATE())
+            GROUP BY CAST(el.time_occurred AS DATE), DATENAME(WEEKDAY, el.time_occurred)
+            ORDER BY MIN(CAST(el.time_occurred AS DATE))
         """)
 
     elif time_range == "monthly":
         query = text("""
-            SELECT 
-                CONCAT('Week ', FLOOR((DAY(time_occurred) - 1) / 7) + 1) AS label,
-                FLOOR((DAY(time_occurred) - 1) / 7) + 1 AS period,
+            SELECT
+                wk AS period,
+                CONCAT(N'Week ', wk) AS label,
                 COUNT(*) AS count
-            FROM exception_logs
-            WHERE MONTH(time_occurred) = MONTH(NOW())
-              AND YEAR(time_occurred) = YEAR(NOW())
-            GROUP BY period, label
-            ORDER BY period
+            FROM (
+                SELECT
+                    ((DATEPART(DAY, el.time_occurred) - 1) / 7) + 1 AS wk
+                FROM dbo.exception_logs el
+                WHERE MONTH(el.time_occurred) = MONTH(GETDATE())
+                  AND YEAR(el.time_occurred) = YEAR(GETDATE())
+            ) t
+            GROUP BY wk
+            ORDER BY wk
         """)
 
     elif time_range == "quarterly":
         query = text("""
-            SELECT 
-                CASE 
-                    WHEN QUARTER(time_occurred) = 1 THEN 'Q1 (Jan-Mar)'
-                    WHEN QUARTER(time_occurred) = 2 THEN 'Q2 (Apr-Jun)'
-                    WHEN QUARTER(time_occurred) = 3 THEN 'Q3 (Jul-Sep)'
-                    WHEN QUARTER(time_occurred) = 4 THEN 'Q4 (Oct-Dec)'
+            SELECT
+                DATEPART(QUARTER, el.time_occurred) AS period,
+                CASE DATEPART(QUARTER, el.time_occurred)
+                    WHEN 1 THEN N'Q1 (Jan-Mar)'
+                    WHEN 2 THEN N'Q2 (Apr-Jun)'
+                    WHEN 3 THEN N'Q3 (Jul-Sep)'
+                    WHEN 4 THEN N'Q4 (Oct-Dec)'
                 END AS label,
-                QUARTER(time_occurred) AS period,
                 COUNT(*) AS count
-            FROM exception_logs
-            WHERE YEAR(time_occurred) = YEAR(NOW())
-            GROUP BY period, label
-            ORDER BY period
+            FROM dbo.exception_logs el
+            WHERE YEAR(el.time_occurred) = YEAR(GETDATE())
+            GROUP BY DATEPART(QUARTER, el.time_occurred)
+            ORDER BY DATEPART(QUARTER, el.time_occurred)
         """)
 
     elif time_range == "yearly":
         query = text("""
-            SELECT 
-                MONTHNAME(time_occurred) AS label,
-                MONTH(time_occurred) AS period,
+            SELECT
+                DATENAME(MONTH, el.time_occurred) AS label,
+                MONTH(el.time_occurred) AS period,
                 COUNT(*) AS count
-            FROM exception_logs
-            WHERE YEAR(time_occurred) = YEAR(NOW())
-            GROUP BY period, label
-            ORDER BY period
+            FROM dbo.exception_logs el
+            WHERE YEAR(el.time_occurred) = YEAR(GETDATE())
+            GROUP BY MONTH(el.time_occurred), DATENAME(MONTH, el.time_occurred)
+            ORDER BY MONTH(el.time_occurred)
         """)
     else:
         raise HTTPException(
@@ -123,15 +151,19 @@ def fetch_logs_by_trend_analysis(
             label = current_date.strftime("%A")
 
             row = next(
-                (r for r in results if str(r["date_val"]) == str(current_date)),
-                None
+                (
+                    r
+                    for r in results
+                    if _row_to_date(r.get("date_val")) == current_date
+                ),
+                None,
             )
 
             data.append({
                 "label": f"{label} ({current_date})",
                 "day": label,
                 "date": str(current_date),
-                "count": int(row["count"]) if row else 0
+                "count": int(row["count"]) if row else 0,
             })
 
     elif time_range == "monthly":
@@ -139,41 +171,63 @@ def fetch_logs_by_trend_analysis(
         current_month = datetime.now().month
         _, last_day = calendar.monthrange(current_year, current_month)
 
-        weeks = sorted(set(
-            ((day - 1) // 7) + 1 for day in range(1, last_day + 1)
-        ))
+        weeks = sorted(
+            set(((day - 1) // 7) + 1 for day in range(1, last_day + 1))
+        )
 
         for week in weeks:
-            row = next((r for r in results if r["period"] == week), None)
+            row = next(
+                (r for r in results if _row_period_int(r.get("period")) == week),
+                None,
+            )
             data.append({
                 "label": f"Week {week}",
                 "week_number": week,
-                "count": int(row["count"]) if row else 0
+                "count": int(row["count"]) if row else 0,
             })
 
     elif time_range == "quarterly":
         for q in range(1, 5):
-            row = next((r for r in results if r["period"] == q), None)
+            row = next(
+                (r for r in results if _row_period_int(r.get("period")) == q),
+                None,
+            )
             data.append({
                 "label": row["label"] if row else f"Q{q}",
                 "quarter": q,
-                "count": int(row["count"]) if row else 0
+                "count": int(row["count"]) if row else 0,
             })
 
     elif time_range == "yearly":
         months = [
-            ("January", 1), ("February", 2), ("March", 3),
-            ("April", 4), ("May", 5), ("June", 6),
-            ("July", 7), ("August", 8), ("September", 9),
-            ("October", 10), ("November", 11), ("December", 12)
+            ("January", 1),
+            ("February", 2),
+            ("March", 3),
+            ("April", 4),
+            ("May", 5),
+            ("June", 6),
+            ("July", 7),
+            ("August", 8),
+            ("September", 9),
+            ("October", 10),
+            ("November", 11),
+            ("December", 12),
         ]
 
         for name, num in months:
-            row = next((r for r in results if r["period"] == num), None)
+            row = next(
+                (
+                    r
+                    for r in results
+                    if _row_period_int(r.get("period")) == num
+                ),
+                None,
+            )
+            lbl = decode_bytes(row["label"]) if row and row.get("label") is not None else name
             data.append({
-                "label": name,
+                "label": lbl,
                 "month": num,
-                "count": int(row["count"]) if row else 0
+                "count": int(row["count"]) if row else 0,
             })
 
     # ----------------------------
@@ -191,20 +245,25 @@ def get_exception_piechart(
     time_range: str = Query("all"),
     db: Session = Depends(get_db)
 ):
-    query = "SELECT Exception_Type, COUNT(*) FROM exception_logs"
+    query = """
+        SELECT et.exception_name, COUNT(*)
+        FROM dbo.exception_logs el
+        JOIN dbo.exception_type et
+          ON et.exception_type_id = el.exception_type_id
+    """
 
     if time_range == "day":
-        query += " WHERE time_occurred >= NOW() - INTERVAL 1 DAY"
+        query += " WHERE el.time_occurred >= DATEADD(DAY, -1, GETDATE())"
     elif time_range == "week":
-        query += " WHERE time_occurred >= NOW() - INTERVAL 7 DAY"
+        query += " WHERE el.time_occurred >= DATEADD(DAY, -7, GETDATE())"
     elif time_range == "month":
-        query += " WHERE time_occurred >= NOW() - INTERVAL 1 MONTH"
+        query += " WHERE el.time_occurred >= DATEADD(MONTH, -1, GETDATE())"
     elif time_range == "quarter":
-        query += " WHERE time_occurred >= NOW() - INTERVAL 3 MONTH"
+        query += " WHERE el.time_occurred >= DATEADD(MONTH, -3, GETDATE())"
     elif time_range == "year":
-        query += " WHERE time_occurred >= NOW() - INTERVAL 1 YEAR"
+        query += " WHERE el.time_occurred >= DATEADD(YEAR, -1, GETDATE())"
 
-    query += " GROUP BY Exception_Type"
+    query += " GROUP BY et.exception_name"
 
     result = db.execute(text(query)).fetchall()
 
@@ -213,12 +272,122 @@ def get_exception_piechart(
         for r in result
     ]
 
+
+def _exception_logs_time_sql_fragment(time_range: str, table_alias: str = "el") -> str:
+    """Append to WHERE ... for dbo.exception_logs time filtering (matches exception_piechart)."""
+    col = f"{table_alias}.time_occurred"
+    if time_range == "all" or not time_range:
+        return ""
+    if time_range == "day":
+        return f" AND {col} >= DATEADD(DAY, -1, GETDATE())"
+    if time_range == "week":
+        return f" AND {col} >= DATEADD(DAY, -7, GETDATE())"
+    if time_range == "month":
+        return f" AND {col} >= DATEADD(MONTH, -1, GETDATE())"
+    if time_range == "quarter":
+        return f" AND {col} >= DATEADD(MONTH, -3, GETDATE())"
+    if time_range == "year":
+        return f" AND {col} >= DATEADD(YEAR, -1, GETDATE())"
+    raise HTTPException(
+        status_code=400,
+        detail="Invalid time_range. Use all, day, week, month, quarter, or year.",
+    )
+
+
+@router.get("/camera_zone_violations")
+def get_camera_zone_violations(
+    time_range: str = Query("week", description="all | day | week | month | quarter | year"),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """
+    Violation counts by zone and by camera for dashboard charts.
+    Uses dbo.exception_logs + dbo.camera; includes all cameras with zero counts in by_camera.
+    """
+    tr = (time_range or "week").strip().lower()
+    time_and = _exception_logs_time_sql_fragment(tr, "el")
+
+    # --- By zone (includes unknown camera / unassigned zone buckets)
+    zone_sql = f"""
+        SELECT
+            CASE
+                WHEN el.camera_id IS NULL THEN N'Unknown camera'
+                ELSE ISNULL(NULLIF(LTRIM(RTRIM(c.zone_name)), N''), N'Unassigned')
+            END AS zone_name,
+            COUNT(*) AS violation_count
+        FROM dbo.exception_logs el
+        LEFT JOIN dbo.camera c ON c.camera_id = el.camera_id
+        WHERE 1 = 1
+        {time_and}
+        GROUP BY
+            CASE
+                WHEN el.camera_id IS NULL THEN N'Unknown camera'
+                ELSE ISNULL(NULLIF(LTRIM(RTRIM(c.zone_name)), N''), N'Unassigned')
+            END
+        ORDER BY violation_count DESC
+    """
+
+    # --- By camera (every row in dbo.camera; zero if no matching logs in range)
+    join_time = _exception_logs_time_sql_fragment(tr, "el")
+
+    camera_sql = f"""
+        SELECT
+            c.camera_id,
+            c.camera_name,
+            c.zone_name,
+            COUNT(el.log_id) AS violation_count
+        FROM dbo.camera c
+        LEFT JOIN dbo.exception_logs el ON el.camera_id = c.camera_id{join_time}
+        GROUP BY c.camera_id, c.camera_name, c.zone_name
+        ORDER BY violation_count DESC, c.camera_id
+    """
+
+    try:
+        zone_rows = db.execute(text(zone_sql)).fetchall()
+        cam_rows = db.execute(text(camera_sql)).fetchall()
+        total_cams = db.execute(text("SELECT COUNT(*) AS n FROM dbo.camera")).scalar()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+    by_zone: List[Dict[str, Any]] = []
+    for r in zone_rows:
+        by_zone.append(
+            {
+                "zone": decode_bytes(r[0]),
+                "count": int(r[1]),
+            }
+        )
+
+    by_camera: List[Dict[str, Any]] = []
+    for r in cam_rows:
+        by_camera.append(
+            {
+                "camera_id": int(r[0]) if r[0] is not None else None,
+                "camera_name": decode_bytes(r[1]) if r[1] is not None else "",
+                "zone_name": decode_bytes(r[2]) if r[2] is not None else "",
+                "count": int(r[3]),
+            }
+        )
+
+    return {
+        "time_range": tr,
+        "total_cameras": int(total_cams or 0),
+        "by_zone": by_zone,
+        "by_camera": by_camera,
+    }
+
+
 @router.get("/bargraph-user-exception-counts")
 def get_user_exception_counts(db: Session = Depends(get_db)):
+    """
+    Kept route path for frontend compatibility.
+    New exception_logs schema uses exception_type_id; resolve labels from exception_type table.
+    """
     result = db.execute(text("""
-        SELECT Username, COUNT(*) 
-        FROM exception_logs
-        GROUP BY Username
+        SELECT et.exception_name, COUNT(*)
+        FROM dbo.exception_logs el
+        JOIN dbo.exception_type et
+          ON et.exception_type_id = el.exception_type_id
+        GROUP BY et.exception_name
     """)).fetchall()
 
     return {
@@ -229,28 +398,8 @@ def get_user_exception_counts(db: Session = Depends(get_db)):
 @router.get("/exception-heatmap")
 def exception_heatmap(db: Session = Depends(get_db)):
     rows = db.execute(text("""
-        SELECT time_occurred, Exception_Type
-        FROM exception_logs
-    """)).fetchall()
-
-    timestamps = [safe_datetime_str(r[0]) for r in rows]
-    counter = Counter(timestamps)
-
-    x = list(counter.keys())
-    y = list(counter.values())
-
-    return {
-        "x": x,
-        "y": y,
-        "max_count": max(y) if y else 0,
-        "max_time": x[y.index(max(y))] if y else None
-    }
-
-@router.get("/exception-heatmap")
-def exception_heatmap(db: Session = Depends(get_db)):
-    rows = db.execute(text("""
-        SELECT time_occurred, Exception_Type
-        FROM exception_logs
+        SELECT time_occurred
+        FROM dbo.exception_logs
     """)).fetchall()
 
     timestamps = [safe_datetime_str(r[0]) for r in rows]
