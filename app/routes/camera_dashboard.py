@@ -134,12 +134,26 @@ MODEL_NORMALIZED_TO_DB_EXCEPTION_NAME: dict[str, str] = {
     "no_vest": "no_safety_vest",
     "no_safetyshoes": "no_safety_shoes",
 }
-EXCEPTION_LOG_THROTTLE_SECONDS = os.environ.get("EMAIL_SENDING_THROTTLE_SECONDS")
+
+def _env_float(name: str, default: float) -> float:
+    """Read an env var as float seconds; fall back safely when unset/invalid."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return float(default)
+    try:
+        val = float(raw)
+        # Negative throttle is invalid; use default.
+        return val if val >= 0 else float(default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+EXCEPTION_LOG_THROTTLE_SECONDS = _env_float("EMAIL_SENDING_THROTTLE_SECONDS", 60.0)
 EXCEPTION_LOG_QUEUE_SIZE = 32
 exception_log_queue: queue.Queue = queue.Queue(maxsize=EXCEPTION_LOG_QUEUE_SIZE)
 _last_exception_log_time: dict = {}  # (cam_id, exception_type) -> time.time()
 _exception_log_time_lock = threading.Lock()
-EMAIL_ENQUEUE_THROTTLE_SECONDS = os.environ.get("EMAIL_SENDING_THROTTLE_SECONDS")
+EMAIL_ENQUEUE_THROTTLE_SECONDS = _env_float("EMAIL_SENDING_THROTTLE_SECONDS", 60.0)
 _last_email_enqueue_time: dict = {}  # (db_camera_id, exception_type) -> time.time()
 _email_enqueue_time_lock = threading.Lock()
 
@@ -1336,7 +1350,8 @@ def _detection_frames_worker():
         try:
             annotated = _annotate_frame(frame, result, filter_by_selected=False) if result is not None else frame
             ts = event.get("timestamp", datetime.utcnow().isoformat())
-            safe_ts = re.sub(r"[^\d\-T:]", "_", ts)[:26]
+            # Windows file names cannot contain ":"; keep timestamp readable but path-safe.
+            safe_ts = re.sub(r"[^\d\-T]", "_", ts).replace(":", "_")[:26]
             filename_base = f"detection_{safe_ts}_cam{cam_id}"
             image_path = os.path.join(DETECTION_FRAMES_DIR, f"{filename_base}.jpg")
             ok = cv2.imwrite(image_path, annotated)
