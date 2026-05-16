@@ -1,12 +1,15 @@
 import base64
 import logging
 from datetime import datetime, timedelta
-from fastapi import APIRouter, Depends, HTTPException
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from typing import Any
 
 from app.database.database import get_db
+from app.exception_log_paths import exception_logs_has_incident_image_path
 from app.routes.camera_config import get_camera_config
 from app.security.rbac import require_permission
 
@@ -15,6 +18,10 @@ router = APIRouter(
     tags=["notification_management"],
     dependencies=[Depends(require_permission("notifications.view"))],
 )
+
+# Sync with camera_dashboard: media/exception_logs/detections/
+_BACKEND_ROOT = Path(__file__).resolve().parents[2]
+_VIOLATION_SNAPSHOT_DIR = _BACKEND_ROOT / "media" / "exception_logs" / "detections"
 
 
 def _decode_bytes(val: Any) -> str:
@@ -77,14 +84,19 @@ def _time_ago(time_occurred) -> str:
 def get_notifications(db: Session = Depends(get_db)):
     """Get latest 12 exception/violation log entries with camera context and timestamps."""
     try:
+        path_column_sql = (
+            "el.incident_image_path,\n                    "
+            if exception_logs_has_incident_image_path(db)
+            else ""
+        )
         result = db.execute(
-            text("""
+            text(f"""
                 SELECT
                     TOP 12
                     el.log_id,
                     et.exception_name AS Exception_Type,
                     el.Incident_image,
-                    el.time_occurred,
+                    {path_column_sql}el.time_occurred,
                     el.updated_at,
                     el.camera_id,
                     c.camera_name,
@@ -105,7 +117,18 @@ def get_notifications(db: Session = Depends(get_db)):
             notification = dict(row)
             if "Exception_Type" in notification:
                 notification["Exception_Type"] = _decode_bytes(notification["Exception_Type"])
-            if "Incident_image" in notification:
+            path_raw = None
+            for key in ("incident_image_path", "Incident_image_path"):
+                v = notification.get(key)
+                if v is not None and str(v).strip():
+                    path_raw = v
+                    break
+            if path_raw is not None:
+                rel = str(path_raw).strip().replace("\\", "/").lstrip("/")
+                # Root-relative so the SPA can prefix VITE_API_BASE_URL (avoids 127.0.0.1 vs LAN IP mismatches).
+                notification["image_url"] = f"/static/{rel}"
+                notification["Incident_image"] = ""
+            elif "Incident_image" in notification:
                 b64 = _incident_image_for_json(notification["Incident_image"])
                 notification["Incident_image"] = b64
                 if b64:
@@ -137,4 +160,43 @@ def get_notifications(db: Session = Depends(get_db)):
         return notifications
     except Exception as e:
         logging.error(f"Database error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/violation-images")
+def list_violation_snapshot_images(
+    limit: int = Query(20, ge=1, le=50, description="Max files to return (newest first)."),
+):
+    """
+    List current violation snapshot JPEGs saved under media/exception_logs/detections/
+    (live detection pipeline). URLs are root-relative /static/... for the SPA to resolve.
+    """
+    images = []
+    try:
+        if not _VIOLATION_SNAPSHOT_DIR.is_dir():
+            return {"images": [], "directory": str(_VIOLATION_SNAPSHOT_DIR)}
+        paths = sorted(
+            _VIOLATION_SNAPSHOT_DIR.glob("*.jpg"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )[:limit]
+        for p in paths:
+            try:
+                st = p.stat()
+                rel = f"exception_logs/detections/{p.name}".replace("\\", "/")
+                images.append(
+                    {
+                        "filename": p.name,
+                        "url": f"/static/{rel}",
+                        "modified_at": datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds"),
+                    }
+                )
+            except OSError:
+                continue
+        return {
+            "images": images,
+            "directory": str(_VIOLATION_SNAPSHOT_DIR),
+        }
+    except Exception as e:
+        logging.error(f"violation-images listing failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))

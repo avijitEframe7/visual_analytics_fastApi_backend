@@ -5,6 +5,7 @@ import math
 import os
 import queue
 import re
+from collections import deque
 import sys
 import threading
 import time
@@ -23,6 +24,7 @@ from sqlalchemy import text
 from ultralytics import YOLO
 
 from app.database.database import SessionLocal
+from app.exception_log_paths import exception_logs_has_incident_image_path
 from app.routes.camera_config import get_camera_config, get_rtsp_urls
 from app.routes.email_feature import enqueue_violation_email
 from app.security.rbac import (
@@ -171,13 +173,24 @@ _detection_frame_time_lock = threading.Lock()
 # Media dirs: <backend>/media/{exception_logs,detection_frames,logs.txt}
 MEDIA_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "media"))
 EXCEPTION_LOGS_DIR = os.path.abspath(os.path.join(MEDIA_ROOT, "exception_logs"))
+# Violation captures for live detection: JPEG only on disk (no blob in DB), FIFO-capped (see MAX_VIOLATION_SNAPSHOT_FILES).
+VIOLATION_SNAPSHOT_DIR = os.path.abspath(os.path.join(EXCEPTION_LOGS_DIR, "detections"))
 DETECTION_FRAMES_DIR = os.path.abspath(os.path.join(MEDIA_ROOT, "detection_frames"))
+# Rolling retention: when the (N+1)th file is saved, the oldest file is deleted (per directory).
+MAX_VIOLATION_SNAPSHOT_FILES = 20
+MAX_DETECTION_FRAME_FILES = 20
 DETECTION_LOG_FILE = os.path.abspath(os.path.join(MEDIA_ROOT, "logs.txt"))
 EXCEPTION_PIPELINE_LOG_PATH = os.path.abspath(os.path.join(MEDIA_ROOT, "exception_pipeline.log"))
 
 # Uploaded file analysis (demo2/3/4): stored under media/uploads
 UPLOAD_FOLDER = os.path.abspath(os.path.join(MEDIA_ROOT, "uploads"))
 ALLOWED_UPLOAD_EXTENSIONS = frozenset({"mp4", "avi", "mov", "mkv", "jpg", "jpeg", "png"})
+
+# FIFO queues for on-disk detection images (paths); enforced in background workers only.
+_violation_snapshot_paths: deque = deque()
+_violation_snapshot_paths_lock = threading.Lock()
+_detection_frame_jpg_paths: deque = deque()
+_detection_frame_paths_lock = threading.Lock()
 
 _exception_pipeline_logger: Optional[logging.Logger] = None
 
@@ -200,6 +213,88 @@ def _log_exception_pipeline(msg: str) -> None:
         _exception_pipeline_logger.info(msg)
     except Exception as e:
         print(f"[camera_dashboard] exception_log: failed to write exception_pipeline.log: {e}")
+
+
+def _unlink_quiet(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _media_relative_path_from_abs(abs_path: str) -> str:
+    """Path segments under MEDIA_ROOT using forward slashes (for /static/... URLs)."""
+    try:
+        rel = os.path.relpath(abs_path, MEDIA_ROOT)
+    except ValueError:
+        rel = os.path.basename(abs_path)
+    return rel.replace(os.sep, "/")
+
+
+def _violation_snapshots_init_fifo_from_disk() -> None:
+    """Trim violation snapshot folder to newest MAX_VIOLATION_SNAPSHOT_FILES; rebuild FIFO deque by mtime."""
+    global _violation_snapshot_paths
+    try:
+        os.makedirs(VIOLATION_SNAPSHOT_DIR, exist_ok=True)
+    except OSError:
+        return
+    jpgs: List[str] = []
+    try:
+        for name in os.listdir(VIOLATION_SNAPSHOT_DIR):
+            if name.lower().endswith(".jpg"):
+                jpgs.append(os.path.join(VIOLATION_SNAPSHOT_DIR, name))
+    except OSError:
+        return
+    jpgs.sort(key=lambda p: os.path.getmtime(p))
+    while len(jpgs) > MAX_VIOLATION_SNAPSHOT_FILES:
+        old = jpgs.pop(0)
+        _unlink_quiet(old)
+    with _violation_snapshot_paths_lock:
+        _violation_snapshot_paths.clear()
+        _violation_snapshot_paths.extend(jpgs)
+
+
+def _fifo_register_violation_snapshot(abs_jpg_path: str) -> None:
+    """After saving a new violation JPEG: append and delete oldest files when count exceeds cap."""
+    with _violation_snapshot_paths_lock:
+        _violation_snapshot_paths.append(abs_jpg_path)
+        while len(_violation_snapshot_paths) > MAX_VIOLATION_SNAPSHOT_FILES:
+            old = _violation_snapshot_paths.popleft()
+            _unlink_quiet(old)
+
+
+def _detection_frames_init_fifo_from_disk() -> None:
+    """Trim detection_frames to newest MAX_DETECTION_FRAME_FILES (.jpg + sibling .json)."""
+    global _detection_frame_jpg_paths
+    try:
+        os.makedirs(DETECTION_FRAMES_DIR, exist_ok=True)
+    except OSError:
+        return
+    jpgs: List[str] = []
+    try:
+        for name in os.listdir(DETECTION_FRAMES_DIR):
+            if name.lower().endswith(".jpg"):
+                jpgs.append(os.path.join(DETECTION_FRAMES_DIR, name))
+    except OSError:
+        return
+    jpgs.sort(key=lambda p: os.path.getmtime(p))
+    while len(jpgs) > MAX_DETECTION_FRAME_FILES:
+        old_jpg = jpgs.pop(0)
+        _unlink_quiet(old_jpg)
+        _unlink_quiet(os.path.splitext(old_jpg)[0] + ".json")
+    with _detection_frame_paths_lock:
+        _detection_frame_jpg_paths.clear()
+        _detection_frame_jpg_paths.extend(jpgs)
+
+
+def _fifo_register_detection_frame(abs_jpg_path: str) -> None:
+    """After saving detection_frame .jpg (+ .json): FIFO-delete oldest pair when over cap."""
+    with _detection_frame_paths_lock:
+        _detection_frame_jpg_paths.append(abs_jpg_path)
+        while len(_detection_frame_jpg_paths) > MAX_DETECTION_FRAME_FILES:
+            old_jpg = _detection_frame_jpg_paths.popleft()
+            _unlink_quiet(old_jpg)
+            _unlink_quiet(os.path.splitext(old_jpg)[0] + ".json")
 
 
 def _raw_class_name_from_names(names: Any, cls_idx: int) -> str:
@@ -1333,7 +1428,11 @@ def _detection_frames_worker():
     """Background thread: save frames with detections to media/detection_frames/ (annotated image + JSON)."""
     try:
         os.makedirs(DETECTION_FRAMES_DIR, exist_ok=True)
-        print(f"[camera_dashboard] Detection-frames worker started; saving to: {DETECTION_FRAMES_DIR}")
+        _detection_frames_init_fifo_from_disk()
+        print(
+            f"[camera_dashboard] Detection-frames worker started; saving to: {DETECTION_FRAMES_DIR} "
+            f"(max {MAX_DETECTION_FRAME_FILES} JPEGs, FIFO)"
+        )
     except Exception as e:
         print(f"[camera_dashboard] detection_frames: ERROR creating dir {DETECTION_FRAMES_DIR}: {e}")
         return
@@ -1361,6 +1460,7 @@ def _detection_frames_worker():
             json_path = os.path.join(DETECTION_FRAMES_DIR, f"{filename_base}.json")
             with open(json_path, "w") as f:
                 json.dump(event, f, indent=2)
+            _fifo_register_detection_frame(image_path)
             print(f"[camera_dashboard] detection_frames: saved {filename_base}.jpg")
         except Exception as e:
             print(f"[camera_dashboard] detection_frames: failed to save: {e}")
@@ -1371,12 +1471,20 @@ def _detection_frames_worker():
 # Exception-log worker (queue → disk → DB + email enqueue)
 # -----------------------------------------------------------------------------
 def _exception_log_worker():
-    """Background thread: consume exception_log_queue, save annotated frame (with violation boxes) to disk, INSERT into dbo.exception_logs."""
+    """
+    Consume exception_log_queue: save violation JPEGs under media/exception_logs/detections/, FIFO-capped.
+    Insert dbo.exception_logs with Incident_image NULL; optional incident_image_path stores media-relative path for UI.
+    """
     try:
         os.makedirs(EXCEPTION_LOGS_DIR, exist_ok=True)
-        _log_exception_pipeline(f"exception_log: Exception-log worker started; saving to: {EXCEPTION_LOGS_DIR}")
+        os.makedirs(VIOLATION_SNAPSHOT_DIR, exist_ok=True)
+        _violation_snapshots_init_fifo_from_disk()
+        _log_exception_pipeline(
+            f"exception_log: worker started; snapshots={VIOLATION_SNAPSHOT_DIR} "
+            f"(max {MAX_VIOLATION_SNAPSHOT_FILES} JPEGs, FIFO)"
+        )
     except Exception as e:
-        _log_exception_pipeline(f"exception_log: ERROR creating dir {EXCEPTION_LOGS_DIR}: {e}")
+        _log_exception_pipeline(f"exception_log: ERROR creating dirs: {e}")
         return
     while True:
         if pipeline_stop_event.is_set():
@@ -1392,24 +1500,16 @@ def _exception_log_worker():
         db_camera_id = _pipeline_index_to_db_camera_id(cam_id)
         safe_type = re.sub(r"[^\w\-]", "_", exception_type)[:32]
         safe_ts = re.sub(r"[^\d\-]", "_", time_occurred)[:20]
-        filename = f"exception_{safe_ts}_{db_camera_id}_{safe_type}.jpg"
-        image_path = os.path.join(EXCEPTION_LOGS_DIR, filename)
+        filename = f"exception_{safe_ts}_{db_camera_id}_{safe_type}_{time.time_ns()}.jpg"
+        image_path = os.path.join(VIOLATION_SNAPSHOT_DIR, filename)
         try:
             cv2.imwrite(image_path, frame)
+            _fifo_register_violation_snapshot(image_path)
             _log_exception_pipeline(f"exception_log: saved image {filename} (with violation boxes)")
         except Exception as e:
             _log_exception_pipeline(f"exception_log: failed to save image: {e}")
             continue
-        # dbo.exception_logs.Incident_image is varbinary(max): store JPEG bytes, not the path string.
-        try:
-            with open(image_path, "rb") as _imgf:
-                image_blob = _imgf.read()
-        except OSError as e:
-            _log_exception_pipeline(f"exception_log: failed to read image for DB: {e}")
-            continue
-        if not image_blob:
-            _log_exception_pipeline("exception_log: empty image file, skip DB insert")
-            continue
+        rel_media_path = _media_relative_path_from_abs(image_path)
         db = SessionLocal()
         try:
             et_id = _resolve_exception_type_id(db, exception_type)
@@ -1419,20 +1519,32 @@ def _exception_log_worker():
                 t_occ = datetime.strptime(time_occurred, "%Y-%m-%d %H:%M:%S")
             except ValueError:
                 t_occ = datetime.now()
-            db.execute(
-                text(
-                    """
-                    INSERT INTO dbo.exception_logs
-                    (time_occurred, exception_type_id, Incident_image, updated_at, camera_id)
-                    VALUES (:t, :eid, :i, GETDATE(), :cid)
-                    """
-                ),
-                {"t": t_occ, "eid": et_id, "i": image_blob, "cid": db_camera_id},
-            )
+            if exception_logs_has_incident_image_path(db):
+                db.execute(
+                    text(
+                        """
+                        INSERT INTO dbo.exception_logs
+                        (time_occurred, exception_type_id, Incident_image, incident_image_path, updated_at, camera_id)
+                        VALUES (:t, :eid, NULL, :p, GETDATE(), :cid)
+                        """
+                    ),
+                    {"t": t_occ, "eid": et_id, "p": rel_media_path, "cid": db_camera_id},
+                )
+            else:
+                db.execute(
+                    text(
+                        """
+                        INSERT INTO dbo.exception_logs
+                        (time_occurred, exception_type_id, Incident_image, updated_at, camera_id)
+                        VALUES (:t, :eid, NULL, GETDATE(), :cid)
+                        """
+                    ),
+                    {"t": t_occ, "eid": et_id, "cid": db_camera_id},
+                )
             db.commit()
             _log_exception_pipeline(
                 f"exception_log: DB insert OK for {exception_type} (exception_type_id={et_id}) "
-                f"camera_id={db_camera_id}"
+                f"camera_id={db_camera_id} path={rel_media_path}"
             )
             # Enqueue email with camera name + zone from dbo.camera (direct query on open session).
             # Throttled separately to keep email notifications at 1-minute intervals.
@@ -1554,6 +1666,7 @@ def start_pipeline(
     pipeline_imshow_queues[:] = [queue.Queue(maxsize=QUEUE_SIZE) for _ in range(n_streams)]
 
     os.makedirs(EXCEPTION_LOGS_DIR, exist_ok=True)
+    os.makedirs(VIOLATION_SNAPSHOT_DIR, exist_ok=True)
     os.makedirs(DETECTION_FRAMES_DIR, exist_ok=True)
 
     _ensure_model_loaded()
