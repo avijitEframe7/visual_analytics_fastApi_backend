@@ -1925,12 +1925,18 @@ async def live_detection_feed_ws(websocket: WebSocket, camera_id: str = "0"):
     Real-time feed over WebSocket. Two modes:
     - If client sends {"mode": "webrtc"}, perform WebRTC signaling (offer/answer) and stream via WebRTC (requires aiortc).
     - Otherwise stream JPEG frames as binary for low-latency canvas rendering.
+
+    Auth: Authorization: Bearer <jwt>, or query ?token=<jwt> (required for browser WebSocket clients).
     """
-    # WebSocket auth: Authorization header only.
+    # WebSocket auth: prefer Authorization header; fallback ?token= for browser WebSocket (no custom headers).
     auth = websocket.headers.get("authorization")
     raw_token = None
     if auth and auth.lower().startswith("bearer "):
         raw_token = auth.split(" ", 1)[1].strip()
+    if not raw_token:
+        q = websocket.query_params.get("token")
+        if q:
+            raw_token = q.strip()
 
     if not raw_token:
         await websocket.close(code=4401)
