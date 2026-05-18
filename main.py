@@ -46,13 +46,14 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# CORS configuration
+# CORS: JWT uses Authorization header — cookies not required. Wildcard + credentials=False
+# avoids browser rejecting Allow-Origin:* with Allow-Credentials:true on cross-origin requests.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],         # GET, POST, PUT, DELETE, etc.
-    allow_headers=["*"],         # Authorization, Content-Type, etc.
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Startup event

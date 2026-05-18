@@ -119,20 +119,18 @@ router = APIRouter(prefix="/api", tags=["Auth"])
 @router.post("/auth/login")
 def login(data: LoginRequest, db: Session = Depends(get_db)):
     username_in = (data.username or "").strip()
-    user = (
+    matches = (
         db.query(User)
-        .filter(
-            User.user_id == data.adminId,
-            User.username == username_in,
-        )
-        .first()
+        .filter(User.username == username_in)
+        .all()
     )
 
-    if not user:
+    if len(matches) != 1:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid id or username"
+            detail="Invalid username or password",
         )
+    user = matches[0]
     # Verify password (one-way): compare SHA256(entered) to stored hash.
     # SQL Server may store HASHBYTES as VARBINARY(32) — ODBC returns bytes; handle that in _parse_stored_password.
     entered = data.password or ""
