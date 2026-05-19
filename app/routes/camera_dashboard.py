@@ -65,6 +65,11 @@ SINGLE_STREAM_BATCH_TIMEOUT = 0.05  # (s) much shorter so single-camera doesn't 
 MAX_RECONNECT_ATTEMPTS = 5
 RECONNECT_DELAY = 2
 
+# If True: write annotated JPEGs + JSON under media/detection_frames/ and violation snapshots under
+# media/exception_logs/detections/. If False: no image files from live detection; dbo.exception_logs,
+# emails, and text logs.txt lines still run (emails have no attachment).
+SAVE_LIVE_DETECTION_IMAGES_TO_DISK = False
+
 # -----------------------------------------------------------------------------
 # Pipeline state: per-camera queues, locks, stats, filters
 # -----------------------------------------------------------------------------
@@ -1286,20 +1291,21 @@ def yolo_batch_worker():
                                     detection_json_queue.put_nowait(event)
                                 except queue.Empty:
                                     pass
-                            # Store detection frame to disk (throttled per camera)
-                            now = time.time()
-                            with _detection_frame_time_lock:
-                                last = _last_detection_frame_time.get(cam_id, 0)
-                                if now - last >= DETECTION_FRAME_THROTTLE_SECONDS:
-                                    _last_detection_frame_time[cam_id] = now
-                                    try:
-                                        detection_frames_queue.put_nowait((frame_copy.copy(), res, event, cam_id))
-                                    except queue.Full:
+                            if SAVE_LIVE_DETECTION_IMAGES_TO_DISK:
+                                # Store detection frame to disk (throttled per camera)
+                                now = time.time()
+                                with _detection_frame_time_lock:
+                                    last = _last_detection_frame_time.get(cam_id, 0)
+                                    if now - last >= DETECTION_FRAME_THROTTLE_SECONDS:
+                                        _last_detection_frame_time[cam_id] = now
                                         try:
-                                            detection_frames_queue.get_nowait()
                                             detection_frames_queue.put_nowait((frame_copy.copy(), res, event, cam_id))
-                                        except queue.Empty:
-                                            pass
+                                        except queue.Full:
+                                            try:
+                                                detection_frames_queue.get_nowait()
+                                                detection_frames_queue.put_nowait((frame_copy.copy(), res, event, cam_id))
+                                            except queue.Empty:
+                                                pass
                         if boxes is not None and len(boxes) > 0 and idx < len(pipeline_output_queues):
                             out_q = pipeline_output_queues[idx]
                             names = res.names if hasattr(res, "names") else getattr(model, "names", {})
@@ -1378,9 +1384,12 @@ def yolo_batch_worker():
                                         if now - last >= EXCEPTION_LOG_THROTTLE_SECONDS:
                                             _last_exception_log_time[key] = now
                                             try:
-                                                # Draw violation boxes here (result is valid); worker only saves this image
-                                                annotated_frame = _annotate_frame_for_exception(frame_copy.copy(), res, v)
-                                                exception_log_queue.put_nowait((cam_id, annotated_frame, v, time_occurred))
+                                                annot = (
+                                                    _annotate_frame_for_exception(frame_copy.copy(), res, v)
+                                                    if SAVE_LIVE_DETECTION_IMAGES_TO_DISK
+                                                    else None
+                                                )
+                                                exception_log_queue.put_nowait((cam_id, annot, v, time_occurred))
                                             except queue.Full:
                                                 _log_exception_pipeline(
                                                     f"exception_log: queue full ({EXCEPTION_LOG_QUEUE_SIZE}), "
@@ -1472,20 +1481,25 @@ def _detection_frames_worker():
 # -----------------------------------------------------------------------------
 def _exception_log_worker():
     """
-    Consume exception_log_queue: save violation JPEGs under media/exception_logs/detections/, FIFO-capped.
-    Insert dbo.exception_logs with Incident_image NULL; optional incident_image_path stores media-relative path for UI.
+    Consume exception_log_queue: optional violation JPEGs to disk (if SAVE_LIVE_DETECTION_IMAGES_TO_DISK);
+    always insert dbo.exception_logs and enqueue email (no image attachment when disk save off).
     """
-    try:
-        os.makedirs(EXCEPTION_LOGS_DIR, exist_ok=True)
-        os.makedirs(VIOLATION_SNAPSHOT_DIR, exist_ok=True)
-        _violation_snapshots_init_fifo_from_disk()
+    if SAVE_LIVE_DETECTION_IMAGES_TO_DISK:
+        try:
+            os.makedirs(EXCEPTION_LOGS_DIR, exist_ok=True)
+            os.makedirs(VIOLATION_SNAPSHOT_DIR, exist_ok=True)
+            _violation_snapshots_init_fifo_from_disk()
+            _log_exception_pipeline(
+                f"exception_log: worker started; snapshots={VIOLATION_SNAPSHOT_DIR} "
+                f"(max {MAX_VIOLATION_SNAPSHOT_FILES} JPEGs, FIFO)"
+            )
+        except Exception as e:
+            _log_exception_pipeline(f"exception_log: ERROR creating dirs: {e}")
+            return
+    else:
         _log_exception_pipeline(
-            f"exception_log: worker started; snapshots={VIOLATION_SNAPSHOT_DIR} "
-            f"(max {MAX_VIOLATION_SNAPSHOT_FILES} JPEGs, FIFO)"
+            "exception_log: worker started; SAVE_LIVE_DETECTION_IMAGES_TO_DISK=False (no violation JPEGs)"
         )
-    except Exception as e:
-        _log_exception_pipeline(f"exception_log: ERROR creating dirs: {e}")
-        return
     while True:
         if pipeline_stop_event.is_set():
             break
@@ -1493,23 +1507,31 @@ def _exception_log_worker():
             item = exception_log_queue.get(timeout=1.0)
         except queue.Empty:
             continue
-        # (cam_id, annotated_frame, exception_type, time_occurred) - cam_id is pipeline stream index
+        # (cam_id, annotated_frame or None, exception_type, time_occurred)
         cam_id, frame, exception_type, time_occurred = item[0], item[1], item[2], item[3]
-        if frame is None or not exception_type:
+        if not exception_type:
             continue
         db_camera_id = _pipeline_index_to_db_camera_id(cam_id)
-        safe_type = re.sub(r"[^\w\-]", "_", exception_type)[:32]
-        safe_ts = re.sub(r"[^\d\-]", "_", time_occurred)[:20]
-        filename = f"exception_{safe_ts}_{db_camera_id}_{safe_type}_{time.time_ns()}.jpg"
-        image_path = os.path.join(VIOLATION_SNAPSHOT_DIR, filename)
-        try:
-            cv2.imwrite(image_path, frame)
-            _fifo_register_violation_snapshot(image_path)
-            _log_exception_pipeline(f"exception_log: saved image {filename} (with violation boxes)")
-        except Exception as e:
-            _log_exception_pipeline(f"exception_log: failed to save image: {e}")
-            continue
-        rel_media_path = _media_relative_path_from_abs(image_path)
+        image_path = ""
+        rel_media_path = None
+
+        if SAVE_LIVE_DETECTION_IMAGES_TO_DISK:
+            if frame is None:
+                _log_exception_pipeline("exception_log: skipped item (missing frame while disk save on)")
+                continue
+            safe_type = re.sub(r"[^\w\-]", "_", exception_type)[:32]
+            safe_ts = re.sub(r"[^\d\-]", "_", time_occurred)[:20]
+            filename = f"exception_{safe_ts}_{db_camera_id}_{safe_type}_{time.time_ns()}.jpg"
+            image_path = os.path.join(VIOLATION_SNAPSHOT_DIR, filename)
+            try:
+                cv2.imwrite(image_path, frame)
+                _fifo_register_violation_snapshot(image_path)
+                _log_exception_pipeline(f"exception_log: saved image {filename} (with violation boxes)")
+            except Exception as e:
+                _log_exception_pipeline(f"exception_log: failed to save image: {e}")
+                continue
+            rel_media_path = _media_relative_path_from_abs(image_path)
+
         db = SessionLocal()
         try:
             et_id = _resolve_exception_type_id(db, exception_type)
@@ -1544,7 +1566,7 @@ def _exception_log_worker():
             db.commit()
             _log_exception_pipeline(
                 f"exception_log: DB insert OK for {exception_type} (exception_type_id={et_id}) "
-                f"camera_id={db_camera_id} path={rel_media_path}"
+                f"camera_id={db_camera_id} path={rel_media_path or '—'}"
             )
             # Enqueue email with camera name + zone from dbo.camera (direct query on open session).
             # Throttled separately to keep email notifications at 1-minute intervals.
@@ -1562,7 +1584,7 @@ def _exception_log_worker():
                     enqueue_violation_email(
                         camera_id=db_camera_id,
                         exception_type=exception_type,
-                        image_path=image_path,
+                        image_path=image_path or "",
                         time_occurred=time_occurred,
                         camera_name=em_name,
                         zone_name=em_zone,
@@ -1666,8 +1688,9 @@ def start_pipeline(
     pipeline_imshow_queues[:] = [queue.Queue(maxsize=QUEUE_SIZE) for _ in range(n_streams)]
 
     os.makedirs(EXCEPTION_LOGS_DIR, exist_ok=True)
-    os.makedirs(VIOLATION_SNAPSHOT_DIR, exist_ok=True)
-    os.makedirs(DETECTION_FRAMES_DIR, exist_ok=True)
+    if SAVE_LIVE_DETECTION_IMAGES_TO_DISK:
+        os.makedirs(VIOLATION_SNAPSHOT_DIR, exist_ok=True)
+        os.makedirs(DETECTION_FRAMES_DIR, exist_ok=True)
 
     _ensure_model_loaded()
 
@@ -1679,13 +1702,15 @@ def start_pipeline(
             name=f"RTSP-{i}",
         ).start()
 
-    # Start workers: YOLO → display_queues; exception log → DB; detection frames → disk
+    # Start workers: YOLO → display_queues; exception log → DB (+ optional disk); optional detection frames
     threading.Thread(target=yolo_batch_worker, daemon=True, name="YOLO-Worker").start()
     threading.Thread(target=_exception_log_worker, daemon=True, name="Exception-Log-Worker").start()
-    threading.Thread(target=_detection_frames_worker, daemon=True, name="Detection-Frames-Worker").start()
+    if SAVE_LIVE_DETECTION_IMAGES_TO_DISK:
+        threading.Thread(target=_detection_frames_worker, daemon=True, name="Detection-Frames-Worker").start()
     # threading.Thread(target=display_worker, daemon=True, name="Display-Worker").start()
     threading.Thread(target=performance_monitor, daemon=True, name="Performance-Monitor").start()
-    print(f"[camera_dashboard] Pipeline started | streams: {n_streams} | detection images: {DETECTION_FRAMES_DIR} | violations: {EXCEPTION_LOGS_DIR}")
+    _disk = f"detection_frames+snapshots on" if SAVE_LIVE_DETECTION_IMAGES_TO_DISK else "disk images off"
+    print(f"[camera_dashboard] Pipeline started | streams: {n_streams} | {_disk} | exception_logs_dir={EXCEPTION_LOGS_DIR}")
 
 
 # -----------------------------------------------------------------------------
@@ -1919,7 +1944,9 @@ async def live_detection_feed(camera_id: str = "0", quality: int = 82, draw_all_
     )
 
 
-@router.websocket("/live_detection_feed_ws")
+# WebSocket must be on public_feed_router: router-level require_permission() injects HTTP-only
+# dependencies that can fail the WS upgrade before this handler runs. Auth is enforced inside.
+@public_feed_router.websocket("/live_detection_feed_ws")
 async def live_detection_feed_ws(websocket: WebSocket, camera_id: str = "0"):
     """
     Real-time feed over WebSocket. Two modes:
@@ -2089,12 +2116,13 @@ def api_start_live_detection(body: Optional[StartBody] = None):
     # so they exist even if the pipeline thread fails later or no detections occur.
     try:
         os.makedirs(EXCEPTION_LOGS_DIR, exist_ok=True)
-        os.makedirs(DETECTION_FRAMES_DIR, exist_ok=True)
+        if SAVE_LIVE_DETECTION_IMAGES_TO_DISK:
+            os.makedirs(DETECTION_FRAMES_DIR, exist_ok=True)
         _ensure_detection_log_file()
         print(
             f"[camera_dashboard] Media dirs ready: "
             f"exception_logs={EXCEPTION_LOGS_DIR}, "
-            f"detection_frames={DETECTION_FRAMES_DIR}, "
+            f"detection_frames={'(disabled)' if not SAVE_LIVE_DETECTION_IMAGES_TO_DISK else DETECTION_FRAMES_DIR}, "
             f"detection_log_file={DETECTION_LOG_FILE}"
         )
     except Exception as e:
